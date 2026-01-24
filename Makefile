@@ -1,4 +1,5 @@
-CC = gcc
+CC = aarch64-linux-gnu-gcc
+AR = aarch64-linux-gnu-ar
 
 CFLAGS = -std=c99 -I./
 LDFLAGS = -shared -fPIC -ldl libnexio.a
@@ -10,7 +11,7 @@ libnexmonkali.so: libnexio.a nexmon.c
 
 libnexio.a: libnexio.c
 	$(CC) -c libnexio.c
-	ar rcs libnexio.a libnexio.o
+	$(AR) rcs libnexio.a libnexio.o
 
 clean:
 	rm libnexmonkali.so libnexio.a libnexio.o
