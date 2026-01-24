@@ -108,12 +108,20 @@ typedef int request_t;
 
 typedef void (*sighandler_t)(int);
 
+struct mmsghdr {
+  struct msghdr msg_hdr;
+  unsigned int msg_len;
+};
+
 static struct nexio *nexio = NULL;
 
 static const char *ifname = "wlan0";
 
 static int (*func_sendto)(int, const void *, size_t, int,
                           const struct sockaddr *, socklen_t) = NULL;
+static ssize_t (*func_sendmsg)(int, const struct msghdr *, int) = NULL;
+static ssize_t (*func_send)(int, const void *, size_t, int) = NULL;
+static int (*func_sendmmsg)(int, struct mmsghdr *, unsigned int, int) = NULL;
 static int (*func_ioctl)(int, request_t, void *) = NULL;
 static int (*func_socket)(int, int, int) = NULL;
 static int (*func_bind)(int, const struct sockaddr *, int) = NULL;
@@ -144,6 +152,18 @@ static void _libmexmon_init() {
     func_sendto =
         (int (*)(int, const void *, size_t, int, const struct sockaddr *,
                  socklen_t))dlsym(REAL_LIBC, "sendto");
+
+  if (!func_sendmsg)
+    func_sendmsg = (ssize_t (*)(int, const struct msghdr *, int))dlsym(
+        REAL_LIBC, "sendmsg");
+
+  if (!func_send)
+    func_send =
+        (ssize_t (*)(int, const void *, size_t, int))dlsym(REAL_LIBC, "send");
+
+  if (!func_sendmmsg)
+    func_sendmmsg = (int (*)(int, struct mmsghdr *, unsigned int, int))dlsym(
+        REAL_LIBC, "sendmmsg");
 
 #ifdef CONFIG_LIBNL
   if (!func_nl_send_auto_complete)
@@ -653,5 +673,156 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
     ret = func_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
   }
 
+  return ret;
+}
+
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
+  ssize_t ret;
+  int inject = 0;
+
+  // Check for injection path - Method 1 (Socket Bound)
+  if ((sockfd > 2) &&
+      (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
+      (socket_to_type[sockfd] == SOCK_RAW) &&
+      (bound_to_correct_if[sockfd] == 1)) {
+    inject = 1;
+  }
+
+  // Check for injection path - Method 2 (Destination Interface)
+  if (!inject && msg->msg_name && (sockfd > 2) &&
+      (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
+      (socket_to_type[sockfd] == SOCK_RAW)) {
+    struct sockaddr_ll *sll = (struct sockaddr_ll *)msg->msg_name;
+    if (sll->sll_ifindex == if_nametoindex(ifname)) {
+      inject = 1;
+    }
+  }
+
+  if (inject) {
+    // Flatten iovec for injection ioctl
+    size_t total_len = 0;
+    for (size_t i = 0; i < msg->msg_iovlen; i++) {
+      total_len += msg->msg_iov[i].iov_len;
+    }
+
+    struct inject_frame *buf_dup =
+        (struct inject_frame *)malloc(total_len + sizeof(struct inject_frame));
+    buf_dup->len = total_len + sizeof(struct inject_frame);
+    buf_dup->pad = 0;
+    buf_dup->type = 1;
+
+    // Copy data from iov
+    size_t offset = 0;
+    for (size_t i = 0; i < msg->msg_iovlen; i++) {
+      memcpy(buf_dup->data + offset, msg->msg_iov[i].iov_base,
+             msg->msg_iov[i].iov_len);
+      offset += msg->msg_iov[i].iov_len;
+    }
+
+    nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup,
+              total_len + sizeof(struct inject_frame), true);
+    free(buf_dup);
+
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 50 * 1000000; // 50 ms
+    nanosleep(&ts, NULL);
+
+    ret = total_len;
+  } else {
+    ret = func_sendmsg(sockfd, msg, flags);
+  }
+
+  return ret;
+}
+
+ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
+  ssize_t ret;
+  int inject = 0;
+
+  // Check for injection path
+  if ((sockfd > 2) &&
+      (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
+      (socket_to_type[sockfd] == SOCK_RAW) &&
+      (bound_to_correct_if[sockfd] == 1)) {
+    inject = 1;
+  }
+
+  if (inject) {
+    struct inject_frame *buf_dup =
+        (struct inject_frame *)malloc(len + sizeof(struct inject_frame));
+    buf_dup->len = len + sizeof(struct inject_frame);
+    buf_dup->pad = 0;
+    buf_dup->type = 1;
+    memcpy(buf_dup->data, buf, len);
+
+    nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup,
+              len + sizeof(struct inject_frame), true);
+    free(buf_dup);
+
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 50 * 1000000; // 50 ms
+    nanosleep(&ts, NULL);
+
+    ret = len;
+  } else {
+    ret = func_send(sockfd, buf, len, flags);
+  }
+  return ret;
+}
+
+int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
+  int ret;
+  int inject = 0;
+
+  // Check for injection path
+  if ((sockfd > 2) &&
+      (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
+      (socket_to_type[sockfd] == SOCK_RAW) &&
+      (bound_to_correct_if[sockfd] == 1)) {
+    inject = 1;
+  }
+
+  if (inject) {
+    // Inject each message individually
+    for (unsigned int i = 0; i < vlen; i++) {
+      struct msghdr *msg = &msgvec[i].msg_hdr;
+
+      size_t total_len = 0;
+      for (size_t j = 0; j < msg->msg_iovlen; j++) {
+        total_len += msg->msg_iov[j].iov_len;
+      }
+
+      struct inject_frame *buf_dup = (struct inject_frame *)malloc(
+          total_len + sizeof(struct inject_frame));
+      buf_dup->len = total_len + sizeof(struct inject_frame);
+      buf_dup->pad = 0;
+      buf_dup->type = 1;
+
+      size_t offset = 0;
+      for (size_t j = 0; j < msg->msg_iovlen; j++) {
+        memcpy(buf_dup->data + offset, msg->msg_iov[j].iov_base,
+               msg->msg_iov[j].iov_len);
+        offset += msg->msg_iov[j].iov_len;
+      }
+
+      nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup,
+                total_len + sizeof(struct inject_frame), true);
+      free(buf_dup);
+
+      // Allow checking result for each, or just count as sent
+      msgvec[i].msg_len = total_len;
+    }
+
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 50 * 1000000; // 50 ms
+    nanosleep(&ts, NULL);
+
+    ret = vlen;
+  } else {
+    ret = func_sendmmsg(sockfd, msgvec, vlen, flags);
+  }
   return ret;
 }
