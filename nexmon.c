@@ -650,10 +650,29 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
   ssize_t ret;
 
   // check if the user wants to write on a raw socket
+  int inject = 0;
+
+  // Method 1: Check if socket was bound to correct interface
   if ((sockfd > 2) &&
       (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
       (socket_to_type[sockfd] == SOCK_RAW) &&
       (bound_to_correct_if[sockfd] == 1)) {
+    inject = 1;
+  }
+
+  // Method 2: Check destination address provided in sendto (used by Reaver)
+  if (!inject && dest_addr && (sockfd > 2) &&
+      (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
+      (socket_to_type[sockfd] == SOCK_RAW)) {
+    struct sockaddr_ll *sll = (struct sockaddr_ll *)dest_addr;
+    if (sll->sll_ifindex == if_nametoindex(ifname)) {
+      inject = 1;
+    }
+  }
+
+  if (inject) {
+    // fprintf(stderr, "sendto(sockfd=%d) -> INJECTION PATH\n", sockfd);
+
     struct inject_frame *buf_dup =
         (struct inject_frame *)malloc(len + sizeof(struct inject_frame));
 
@@ -666,6 +685,13 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
               len + sizeof(struct inject_frame), true);
 
     free(buf_dup);
+
+    // this is probably frowned on, but it works on the Nexus 6P
+    // rate-limiting keeps the driver from crashing when doing aireplay-ng
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 50 * 1000000; // 50 ms
+    nanosleep(&ts, NULL);
 
     ret = len;
   } else {
