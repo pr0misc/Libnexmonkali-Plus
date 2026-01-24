@@ -1,23 +1,71 @@
-# libnexmonkali
+# libnexmonkali (Samsung S10 Optimized)
 
-Version of libnexmon.so from https://github.com/seemoo-lab/nexmon for buiding and usage in Kali Nethunter Chroot with the Huawei Nexus 6p.
-<P>There is a prebuilt version of libnexmonkali.so available in the repo. This needs to be installed to /usr/lib/ in the kali chroot.
+This is a heavily modified version of `libnexmonkali`, specifically optimized for the Samsung S10 (and similar Broadcom-based devices) to ensure full functionality with modern penetration testing tools like `Reaver`, `Aireplay-ng`, `Airodump-ng`, and `Kismet`.
 
-# What's changed?
-<P>This is a <B>replacement</B> for the `kalilibnexmon.so` that ships in Kali NetHunter 2020.3 in `/system/lib64/kalilibnexmon.so`.
-<P>This version adds ioctl() support for SIOCSIWFREQ and SIOCGIWFREQ, meaning that programs that use ioctl calls will be able to directly get/set the channel of the onboard wifi instead of relying on the `nexutil` tool.
-<P>Additionally, it adds a 50 millisecond delay after each injected frame, which seems to eliminate driver crashes when doing deauths with aireplay-ng.
+## 🚀 Key Modifications & Features
 
+### 1. Universal Packet Injection Support
+The original library only intercepted `write()` calls, which caused tools like `Reaver` to fail injection. This version implements hooks for **all** packet transmission system calls:
+- `write()`
+- `sendto()` (Used by Reaver)
+- `sendmsg()`
+- `send()`
+- `sendmmsg()`
 
+All trapped packets are automatically encapsulated and injected via the custom Broadcom `NEX_INJECT_FRAME` IOCTL, ensuring full compatibility with the complete Aircrack-ng suite and Reaver.
 
+### 2. Reliable Handshake Capture (Power Management Fix)
+We addressed a critical issue where the wifi chip would sleep while waiting for DTIM beacons, causing it to miss EAPOL M2/M4 packets during a handshake capture. 
 
-# Steps to Build
+**The Modification:** We added an explicit `WLC_SET_PM = 0` (Constantly Awake Mode) command during initialization. This ensures the radio stays awake to capture 100% of frames, fixing issues with missing 4-way handshakes.
 
-Clone the repo:
-  git clone https://github.com/dracode/libnexmonkali
+### 3. Extended Range (TX Power Boost)
+To address reception and injection range issues, we added an automatic `WLC_SET_TXPWR` command (configured to `500`) during the interface initialization. This overrides default power saving limits to maximize transmission power.
 
-Build:
-  make
-  
-Install:
-  make install
+---
+
+## 🛠️ Complete Usage Guide
+
+### 1. Build
+You need an `aarch64` cross-compiler or a native environment (Termux/Kali Chroot).
+
+```bash
+# Clean previous builds
+make clean
+
+# Compile the shared library
+make
+```
+
+### 2. Install
+Copy the compiled `libnexmonkali.so` to your device (e.g., in your home folder or a dedicated directory).
+
+```bash
+cp libnexmonkali.so /root/libnexmonkali.so
+```
+
+### 3. Running Tools
+You must **preload** the library whenever you run a wifi-related tool.
+
+#### Enable Monitor Mode
+This step is crucial as it initializes our custom IOCTLs (Power Boost, CAM, etc.).
+```bash
+LD_PRELOAD=/root/libnexmonkali.so AIRMON_NG=1 airmon-ng start wlan0
+```
+
+#### Packet Injection (Reaver/Aireplay-ng)
+Reaver will now work correctly due to the `sendto`/`send` hooks.
+```bash
+LD_PRELOAD=/root/libnexmonkali.so reaver -i wlan0 -b <BSSID> -vv
+```
+
+#### Sniffing (Airodump-ng)
+```bash
+LD_PRELOAD=/root/libnexmonkali/libnexmonkali.so airodump-ng wlan0
+```
+
+---
+
+**Credits:**
+Original work by the Nexmon Team.
+Modifications for Samsung S10/Kali integration by [Your Name/Handle].
