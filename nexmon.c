@@ -272,7 +272,7 @@ int handle_nl_msg(struct nl_msg *msg) {
     // this device doesn't support 80+80 anyway
     // if(attr[NL80211_ATTR_CENTER_FREQ2])
     //	fprintf(stderr, "NL80211_ATTR_CENTER_FREQ2 = %u\n",
-    //nla_get_u32(attr[NL80211_ATTR_CENTER_FREQ2]));
+    // nla_get_u32(attr[NL80211_ATTR_CENTER_FREQ2]));
 
     if (ht_mode == NL80211_CHAN_HT40PLUS) {
       if (band == WL_CHANSPEC_BAND_2G) {
@@ -411,6 +411,12 @@ int ioctl(int fd, request_t request, ...) {
     if (!strncmp(p_wrq->ifr_ifrn.ifrn_name, ifname, strlen(ifname))) {
       if (p_wrq->u.mode == IW_MODE_MONITOR) {
         buf = MONITOR_RADIOTAP;
+        int promisc = 1;
+        nex_ioctl(nexio, WLC_SET_PROMISC, &promisc, 4, true);
+        int txpwr = 500; // Boost power
+        nex_ioctl(nexio, WLC_SET_TXPWR, &txpwr, 4, true);
+        int pm = 0; // Disable Power Management (CAM)
+        nex_ioctl(nexio, WLC_SET_PM, &pm, 4, true);
       } else {
         buf = MONITOR_DISABLED;
       }
