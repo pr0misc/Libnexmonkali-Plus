@@ -74,8 +74,11 @@ typedef unsigned int uint;
 
 #define TYPEDEF_BOOL // define this to make <typedefs.h> not throw an error
                      // trying to redefine bool
-#include <bcmwifi_channels.h>
+#include <stdint.h>
 #include <typedefs.h>
+typedef uint16_t uint16;
+typedef uint8_t uint8;
+#include <bcmwifi_channels.h>
 
 #define WLC_GET_MONITOR 107
 #define WLC_SET_MONITOR 108
