@@ -14,7 +14,7 @@ libnexio.a: libnexio.c
 	$(AR) rcs libnexio.a libnexio.o
 
 clean:
-	rm libnexmonkali.so libnexio.a libnexio.o
+	rm -f libnexmonkali.so libnexio.a libnexio.o
 	
 install:
 	cp libnexmonkali.so /usr/lib/
