@@ -7,7 +7,7 @@ LDFLAGS = -shared -fPIC -ldl libnexio.a
 all: libnexio.a libnexmonkali.so
 
 libnexmonkali.so: libnexio.a nexmon.c
-	$(CC) -o libnexmonkali.so $(CFLAGS) nexmon.c $(LDFLAGS)
+	$(CC) -o $@ -std=c99 -I./ -I/usr/include/libnl3 nexmon.c -shared -fPIC -ldl libnexio.a
 
 libnexio.a: libnexio.c
 	$(CC) -c libnexio.c

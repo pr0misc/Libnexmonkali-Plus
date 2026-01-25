@@ -39,6 +39,8 @@
  *                                                                         *
  **************************************************************************/
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <dlfcn.h>
 #include <errno.h>
 #include <linux/if_arp.h>
@@ -46,6 +48,7 @@
 #include <linux/wireless.h>
 #include <monitormode.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <nexioctls.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -53,6 +56,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #define CONFIG_LIBNL
 
@@ -65,10 +69,6 @@
 #include <netlink/genl/genl.h>
 #include <netlink/msg.h>
 #endif // CONFIG_LIBNL
-
-#define __USE_POSIX199309
-#define _POSIX_C_SOURCE 199309L
-#include <time.h>
 
 typedef unsigned int uint;
 
@@ -421,6 +421,15 @@ int ioctl(int fd, request_t request, ...) {
           buf & MONITOR_LOG_ONLY || buf & MONITOR_DROP_FRM ||
           buf & MONITOR_IPV4_UDP) {
         p_wrq->u.mode = IW_MODE_MONITOR;
+
+        // Passive enforcement for nexutil-based monitor mode (S10 BCM4375B1)
+        // These settings are critical for handshake capture and WPS attacks
+        // Errors are ignored to prevent "Operation Not Supported" issues
+        int pm = 0; // CAM mode - prevents sleep, crucial for EAPOL/WPS frames
+        nex_ioctl(nexio, WLC_SET_PM, &pm, 4, true);
+
+        int promisc = 1; // Ensures we see all packets
+        nex_ioctl(nexio, WLC_SET_PROMISC, &promisc, 4, true);
       }
 
       ret = 0;
@@ -436,8 +445,6 @@ int ioctl(int fd, request_t request, ...) {
         buf = MONITOR_RADIOTAP;
         int promisc = 1;
         nex_ioctl(nexio, WLC_SET_PROMISC, &promisc, 4, true);
-        int txpwr = 500; // Boost power
-        nex_ioctl(nexio, WLC_SET_TXPWR, &txpwr, 4, true);
         int pm = 0; // Disable Power Management (CAM)
         nex_ioctl(nexio, WLC_SET_PM, &pm, 4, true);
       } else {
@@ -478,6 +485,16 @@ int ioctl(int fd, request_t request, ...) {
 
       // fprintf(stderr, "SIWFREQ: channel=%08x\n", channel);
       ret = nex_set_channel_simple(channel);
+
+      // Enforce PM and Promisc after channel change
+      // Changing channel can sometimes reset power save mode or promisc state
+      // This ensures we stay awake and listening, preventing "Waiting for
+      // beacon" hangs
+      int pm = 0;
+      nex_ioctl(nexio, WLC_SET_PM, &pm, 4, true);
+
+      int promisc = 1;
+      nex_ioctl(nexio, WLC_SET_PROMISC, &promisc, 4, true);
     }
 
     // if (ret < 0)
@@ -616,9 +633,24 @@ struct inject_frame {
 ssize_t write(int fd, const void *buf, size_t count) {
   ssize_t ret;
 
-  // check if the user wants to write on a raw socket
+  int inject = 0;
+
+  // Method 1: Bound socket (standard path)
   if ((fd > 2) && (fd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
       (socket_to_type[fd] == SOCK_RAW) && (bound_to_correct_if[fd] == 1)) {
+    inject = 1;
+  }
+
+  // Method 2: Unbound raw socket (fallback for aireplay-ng deauth)
+  // Some versions of aireplay-ng don't bind() before write()
+  // On monitor mode devices, raw socket writes are almost always injection
+  if (!inject && (fd > 2) &&
+      (fd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
+      (socket_to_type[fd] == SOCK_RAW)) {
+    inject = 1;
+  }
+
+  if (inject) {
     struct inject_frame *buf_dup =
         (struct inject_frame *)malloc(count + sizeof(struct inject_frame));
 
@@ -636,7 +668,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
     // rate-limiting keeps the driver from crashing when doing aireplay-ng
     struct timespec ts;
     ts.tv_sec = 0;
-    ts.tv_nsec = 50 * 1000000; // 50 ms
+    ts.tv_nsec = 70 * 1000000; // 70 ms
     nanosleep(&ts, NULL);
 
     ret = count;
@@ -693,7 +725,7 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
     // rate-limiting keeps the driver from crashing when doing aireplay-ng
     struct timespec ts;
     ts.tv_sec = 0;
-    ts.tv_nsec = 50 * 1000000; // 50 ms
+    ts.tv_nsec = 70 * 1000000; // 70 ms
     nanosleep(&ts, NULL);
 
     ret = len;
@@ -754,7 +786,7 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
 
     struct timespec ts;
     ts.tv_sec = 0;
-    ts.tv_nsec = 50 * 1000000; // 50 ms
+    ts.tv_nsec = 70 * 1000000; // 70 ms
     nanosleep(&ts, NULL);
 
     ret = total_len;
@@ -791,7 +823,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
 
     struct timespec ts;
     ts.tv_sec = 0;
-    ts.tv_nsec = 50 * 1000000; // 50 ms
+    ts.tv_nsec = 70 * 1000000; // 70 ms
     nanosleep(&ts, NULL);
 
     ret = len;
@@ -846,7 +878,7 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
 
     struct timespec ts;
     ts.tv_sec = 0;
-    ts.tv_nsec = 50 * 1000000; // 50 ms
+    ts.tv_nsec = 70 * 1000000; // 70 ms
     nanosleep(&ts, NULL);
 
     ret = vlen;
