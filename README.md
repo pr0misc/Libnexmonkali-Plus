@@ -67,4 +67,4 @@ This software is for educational purposes and authorized security auditing only.
  * Original Work: [Nexmon Team](https://github.com/seemoo-lab/nexmon)
  * Inspiration & Motivation: [yesimxev](https://github.com/yesimxev)
  * Original Library: [RoninNada](https://github.com/RoninNada/libnexmonkali)
- * S10 Optimization & Fork: [qazianwar222](https://github.com/qazianwar222)
+ * S10 Optimization & Fork: [qazianwar222](https://github.com/pr0misc)
