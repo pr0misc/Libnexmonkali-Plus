@@ -1,19 +1,9 @@
 #!/bin/bash
 # nxsp - Helper script to run any tool with Libnexmonkali-Plus
-# Usage: nxsp <delay_ms> <command> [args...]
-
-if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <delay_ms> <command> [args...]"
-    echo "Example: nxsp 5 mdk4 wlan0 b -c 1"
-    echo "Example: nxsp 0 reaver -i wlan0 ..."
-    exit 1
-fi
-
-DELAY_MS=$1
-shift # Remove delay from args
-
-# Convert ms to ns for the library
-export NEXMON_DELAY=$(($DELAY_MS * 1000000))
+# Usage: 
+#   nxsp load              -> Spawns a new shell with library loaded (Default 70ms)
+#   nxsp unload            -> Spawns a new shell with library UNLOADED
+#   nxsp <delay> <cmd> ... -> Runs specific command with custom delay (0-X ms)
 
 # Locate the library
 # 1. Try directory where script is located (Portable/Dev mode)
@@ -27,9 +17,43 @@ else
     echo "Error: libnexmonkali.so not found!"
     echo "Checked: $SCRIPT_DIR/libnexmonkali.so"
     echo "Checked: /usr/lib/libnexmonkali.so"
-    echo "Please build with 'make' or install with 'make install'"
     exit 1
 fi
 
-echo "[*] nxsp: Launching '$1' with ${DELAY_MS}ms delay..."
-LD_PRELOAD=$LIBPATH "$@"
+MODE="$1"
+
+if [ "$MODE" == "load" ]; then
+    echo "[*] nxsp: Spawning new shell with Libnexmonkali loaded..."
+    echo "[*] Default Delay: 70ms (Safe Mode). Use 'export NEXMON_DELAY=0' to override."
+    echo "[*] Type 'exit' or use 'nxsp unload' to leave this mode."
+    export LD_PRELOAD=$LIBPATH
+    # Default to safe mode if not set
+    if [ -z "$NEXMON_DELAY" ]; then export NEXMON_DELAY=70000000; fi
+    exec $SHELL
+
+elif [ "$MODE" == "unload" ]; then
+    echo "[*] nxsp: Spawning new shell WITHOUT Libnexmonkali..."
+    unset LD_PRELOAD
+    unset NEXMON_DELAY
+    exec $SHELL
+
+elif [[ "$MODE" =~ ^[0-9]+$ ]]; then
+    # Numeric delay mode
+    if [ "$#" -lt 2 ]; then
+        echo "Usage: nxsp <delay_ms> <command> [args...]"
+        exit 1
+    fi
+    DELAY_MS=$1
+    shift
+    export NEXMON_DELAY=$(($DELAY_MS * 1000000))
+    # echo "[*] nxsp: Launching '$1' with ${DELAY_MS}ms delay..."
+    LD_PRELOAD=$LIBPATH "$@"
+
+else
+    echo "Usage:"
+    echo "  nxsp load              : Start session with library loaded"
+    echo "  nxsp unload            : Start session without library"
+    echo "  nxsp <ms> <cmd> [args] : Run command with specific delay ms"
+    echo "Example: nxsp 0 reaver -i wlan0 ..."
+    exit 1
+fi

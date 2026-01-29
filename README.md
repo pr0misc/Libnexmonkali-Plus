@@ -49,20 +49,35 @@ nexutil -s0x613 -i -v2
 ```
 
 Step 2: Run Tools (NetHunter Side)
-Use `nxsp` followed by your desired delay (or 0 for auto) and the tool command.
+Use `nxsp` to run tools. You have two options:
 
-**Auto-Mode (Recommended):**
+**Option A: Single Command (Recommended)**
+Run explicit commands with "Smart Speed" (auto) or custom delay:
 ```bash
-# nxsp automatically detects the tool and sets the best speed
+# Auto-detect (Best Speed)
 nxsp 0 reaver -i wlan0 -b ...
-nxsp 0 wifite --kill
+
+# Manual Override (e.g., 15ms)
+nxsp 15 mdk4 wlan0 ...
 ```
 
-**Manual Override:**
-If you want to force a specific speed (e.g., 5ms) for a new/unknown tool:
+**Option B: Shell Mode (Legacy Style)**
+Load the library into a new shell session. All subsequent commands in this shell will use the library.
 ```bash
-# Force 5ms delay
-nxsp 5 mdk4 wlan0 ...
+# Enter "Nexmon Shell"
+nxsp load
+
+# Check if it's working
+echo $LD_PRELOAD  # Should show /usr/lib/libnexmonkali.so
+echo $NEXMON_DELAY # Should be 70000000 (70ms default)
+
+# Run tools normally
+reaver -i wlan0 ...
+
+# Exit the shell to unload
+exit
+# Or force unload (starts clean shell)
+nxsp unload
 ```
 
 **Legacy Usage (LD_PRELOAD):**
