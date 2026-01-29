@@ -29,7 +29,7 @@ install: libnexmonkali.so
 	ldconfig || true
 	@echo "--------------------------------------------------"
 	@echo "SUCCESS: 'nxsp' is now installed globally."
-	@echo "Usage: nxsp <delay> <tool> [args]"
+	@echo "Usage: nxsp load | nxsp <delay> <tool>"
 	@echo "--------------------------------------------------"
 
 uninstall:
