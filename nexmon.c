@@ -822,6 +822,11 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     }
   }
 
+  // Safety: Ensure iov is valid
+  if (inject && (!msg->msg_iov || msg->msg_iovlen == 0)) {
+      inject = 0;
+  }
+
   if (inject) {
     // Flatten iovec for injection ioctl
     size_t total_len = 0;
@@ -929,6 +934,11 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
       (socket_to_type[sockfd] == SOCK_RAW) &&
       (bound_to_correct_if[sockfd] == 1)) {
     inject = 1;
+  }
+
+  // Safety: Ensure valid vector
+  if (inject && (!msgvec || vlen == 0)) {
+      inject = 0;
   }
 
   if (inject) {
