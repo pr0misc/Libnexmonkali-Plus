@@ -1,0 +1,35 @@
+#!/bin/bash
+# nxsp - Helper script to run any tool with Libnexmonkali-Plus
+# Usage: nxsp <delay_ms> <command> [args...]
+
+if [ "$#" -lt 2 ]; then
+    echo "Usage: $0 <delay_ms> <command> [args...]"
+    echo "Example: nxsp 5 mdk4 wlan0 b -c 1"
+    echo "Example: nxsp 0 reaver -i wlan0 ..."
+    exit 1
+fi
+
+DELAY_MS=$1
+shift # Remove delay from args
+
+# Convert ms to ns for the library
+export NEXMON_DELAY=$(($DELAY_MS * 1000000))
+
+# Locate the library
+# 1. Try directory where script is located (Portable/Dev mode)
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+if [ -f "$SCRIPT_DIR/libnexmonkali.so" ]; then
+    LIBPATH="$SCRIPT_DIR/libnexmonkali.so"
+# 2. Try global system library path (Installed mode)
+elif [ -f "/usr/lib/libnexmonkali.so" ]; then
+    LIBPATH="/usr/lib/libnexmonkali.so"
+else
+    echo "Error: libnexmonkali.so not found!"
+    echo "Checked: $SCRIPT_DIR/libnexmonkali.so"
+    echo "Checked: /usr/lib/libnexmonkali.so"
+    echo "Please build with 'make' or install with 'make install'"
+    exit 1
+fi
+
+echo "[*] nxsp: Launching '$1' with ${DELAY_MS}ms delay..."
+LD_PRELOAD=$LIBPATH "$@"
