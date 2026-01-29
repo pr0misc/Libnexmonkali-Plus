@@ -16,10 +16,23 @@ libnexio.a: libnexio.c
 clean:
 	rm -f libnexmonkali.so libnexio.a libnexio.o
 	
-install:
-	cp libnexmonkali.so /usr/lib/
-	chmod 0755 /usr/lib/libnexmonkali.so
-	chmod +x /usr/lib/libnexmonkali.so
+install: libnexmonkali.so
+	@echo "Installing Libnexmonkali-Plus..."
+	@# Ensure directories exist
+	install -d /usr/lib
+	install -d /usr/bin
+	@# Install library with 755 permissions
+	install -m 755 libnexmonkali.so /usr/lib/
+	@# Install script with 755 permissions (executable)
+	install -m 755 nxsp /usr/bin/
+	@# Optional: update library cache
+	ldconfig || true
+	@echo "--------------------------------------------------"
+	@echo "SUCCESS: 'nxsp' is now installed globally."
+	@echo "Usage: nxsp <delay> <tool> [args]"
+	@echo "--------------------------------------------------"
 
 uninstall:
-	rm /usr/lib/libnexmonkali.so
+	rm -f /usr/lib/libnexmonkali.so
+	rm -f /usr/bin/nxsp
+	@echo "Uninstalled successfully."
