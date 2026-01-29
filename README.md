@@ -22,44 +22,55 @@ To maximize signal reach for both injection and reception, this library issues a
 4. Channel Switching Stability (Deafness Fix)
 The Problem: On some firmware versions (like the S10 BCM4375B1), switching channels—whether manually or via tools like Wifite—causes the Wi-Fi chip to reset its Power Management state to "Enabled" (Sleep Mode). This leads to the interface going "deaf" (missing beacons/packets) immediately after a channel hop, causing tools to hang waiting for targets.
 The Fix: We hooked the SIOCSIWFREQ (Set Frequency) call to strictly re-enforce WLC_SET_PM = 0 (Wake) and WLC_SET_PROMISC = 1 (Promiscuous) every single time the channel changes. This ensures the radio never sleeps during multi-channel attacks or scanning.
-🛠️ Build Instructions
-You will need an aarch64 cross-compiler or a native build environment (such as Termux or a Kali Chroot on the device).
-1. Clean & Compile
-# Clean previous build artifacts
-make clean
 
-# Compile the shared library
-make
+5. Smart Speed (Auto-Optimization)
+The library now includes "Smart Process Detection". It inspects the tool name running and automatically sets the optimal injection delay to protect your device:
+ * `reaver`, `bully`: **5ms** (Max Speed for WPS attacks)
+ * `aireplay-ng`: **15ms** (High Speed for deauths)
+ * `airodump-ng`: **40ms** (Balanced for scanning)
+ * `*` (Default): **70ms** (Safe Mode for stability)
 
-2. Installation
-Copy the compiled shared object to a accessible location on your device.
-cp libnexmonkali.so /usr/lib/libnexmonkali.so
-# Or keep it in your home directory
-cp libnexmonkali.so ~/libnexmonkali.so
+🛠️ Build & Install
+You will need an aarch64 cross-compiler or a native build environment (Termux/NetHunter).
+
+1. Build & Install
+```bash
+# Clean, Compile, and Install to /usr/bin/nxsp
+make clean && make && sudo make install
+```
 
 💻 Usage Guide
-To use the optimizations, you must preload the library when running Wi-Fi related tools.
-Step 1: Enable Monitor Mode
-This step is critical. It initializes the interface and triggers our custom IOCTLs (Power Boost & CAM).
-For Samsung S10 (Galaxy S10/S10+/S10e):
+We provide a global helper script `nxsp` (Nexmon Shim Program) to make running tools easy.
+
+Step 1: Enable Monitor Mode (Android Side)
+This step initializes the hardware. Do this in a Root terminal (Termux/ADB):
+```bash
 nexutil -s0x613 -i -v2
+```
 
-For Generic Broadcom Devices:
-nexutil -m2
+Step 2: Run Tools (NetHunter Side)
+Use `nxsp` followed by your desired delay (or 0 for auto) and the tool command.
 
-Step 2: Running Tools (LD_PRELOAD)
-You can run tools individually by exporting the library before the command.
-Example: Running Airodump-ng
-LD_PRELOAD=/path/to/libnexmonkali.so airodump-ng wlan0
+**Auto-Mode (Recommended):**
+```bash
+# nxsp automatically detects the tool and sets the best speed
+nxsp 0 reaver -i wlan0 -b ...
+nxsp 0 wifite --kill
+```
 
-Example: Running Reaver
-LD_PRELOAD=/path/to/libnexmonkali.so reaver -i wlan0 -b <BSSID> -vv
+**Manual Override:**
+If you want to force a specific speed (e.g., 5ms) for a new/unknown tool:
+```bash
+# Force 5ms delay
+nxsp 5 mdk4 wlan0 ...
+```
 
-> Pro Tip: To avoid typing this every time, you can export it for your current session:
-> export LD_PRELOAD=/path/to/libnexmonkali.so
-> # Now run tools normally
-> airodump-ng wlan0
-> 
+**Legacy Usage (LD_PRELOAD):**
+You can still use the traditional method if you prefer:
+```bash
+export NEXMON_DELAY=0
+LD_PRELOAD=/usr/lib/libnexmonkali.so reaver ...
+``` 
 > 
 ⚠️ Disclaimer
 This software is for educational purposes and authorized security auditing only. The authors are not responsible for any misuse or damage caused by this software. Ensure you comply with all local laws and regulations regarding radio transmission and network security.
