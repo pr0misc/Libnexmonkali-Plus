@@ -695,6 +695,11 @@ ssize_t write(int fd, const void *buf, size_t count) {
     inject = 1;
   }
 
+  // Safety: If buf is NULL or length is 0, skip injection (handles mmap flushes)
+  if (inject && (!buf || count == 0)) {
+      inject = 0;
+  }
+
   if (inject) {
     if ((count + sizeof(struct inject_frame)) > MAX_INJECT_BUF) {
        // Fallback for oversized packets (rare)
