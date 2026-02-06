@@ -118,15 +118,12 @@ static int __nex_driver_io(struct ifreq *ifr, struct nex_ioctl *ioc) {
 
   ret = ioctl(s, SIOCDEVPRIVATE, ifr);
 
-  // Suppress errors for optional optimization commands
-  // These may not be supported on all firmware versions
+  // Suppress EINVAL and EOPNOTSUPP errors for cleaner output
+  // These are expected on Android/Nexmon when tools try unsupported operations
+  // The operations still fail gracefully, we just don't spam the console
   int suppress_error = 0;
-  if (ret < 0) {
-    // WLC_SET_PM (86), WLC_SET_TXPWR (66), WLC_SET_PROMISC (10)
-    if ((ioc->cmd == 86 || ioc->cmd == 66 || ioc->cmd == 10) &&
-        (errno == EINVAL || errno == EOPNOTSUPP)) {
-      suppress_error = 1;
-    }
+  if (ret < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) {
+    suppress_error = 1;
   }
 
   if (ret < 0 && errno != EAGAIN && !suppress_error)

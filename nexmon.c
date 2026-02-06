@@ -136,9 +136,23 @@ static int (*func_nl_send_auto_complete)(struct nl_sock *,
 
 static long inject_delay_ns = 70000000; // Default 70ms
 
+// Process detection flags for tool-specific behavior
+static int is_kismet = 0;
+static int is_hcxdumptool = 0;
+static int is_aireplay = 0;  // Excluded from stability enforcement (causes crashes)
+
+// Additional function pointers for new hooks
+static ssize_t (*func_read)(int, void *, size_t) = NULL;
+
 static void _libmexmon_init() __attribute__((constructor));
 static void _libmexmon_init() {
   nexio = nex_init_ioctl(ifname);
+
+  // Radio stabilization delay - helps when switching between attacks
+  // When wifite spawns a new attack process, this gives the firmware
+  // time to recover from the previous attack's state
+  struct timespec init_delay = {.tv_sec = 0, .tv_nsec = 300000000}; // 300ms
+  nanosleep(&init_delay, NULL);
 
   // Performance Optimization: Configurable Delay & Smart Auto-Detect
   // Priority 1: User Override via environment variable
@@ -166,6 +180,7 @@ static void _libmexmon_init() {
           }
           // Aireplay-ng: 15ms (High Speed)
           else if (strstr(proc_name, "aireplay")) {
+              is_aireplay = 1;  // Flag to exclude from stability enforcement
               inject_delay_ns = 15000000; // 15ms
               // fprintf(stderr, "LIBNEXMON: Auto-detected %s - Setting HIGH SPEED (15ms)\n", proc_name);
           }
@@ -173,6 +188,18 @@ static void _libmexmon_init() {
           else if (strstr(proc_name, "airodump")) {
              inject_delay_ns = 40000000; // 40ms
              // fprintf(stderr, "LIBNEXMON: Auto-detected %s - Setting MONITOR SPEED (40ms)\n", proc_name);
+          }
+          // Kismet: 20ms (Balanced for scanning, needs stability enforcement)
+          else if (strstr(proc_name, "kismet")) {
+              is_kismet = 1;
+              inject_delay_ns = 20000000; // 20ms
+              // fprintf(stderr, "LIBNEXMON: Auto-detected Kismet - Setting SCAN SPEED (20ms)\n");
+          }
+          // hcxdumptool: 10ms (Aggressive capture, needs stability enforcement)
+          else if (strstr(proc_name, "hcxdumptool")) {
+              is_hcxdumptool = 1;
+              inject_delay_ns = 10000000; // 10ms
+              // fprintf(stderr, "LIBNEXMON: Auto-detected hcxdumptool - Setting CAPTURE SPEED (10ms)\n");
           }
           // Default for unknown tools remains 70ms (Safe Mode)
       }
@@ -214,6 +241,9 @@ static void _libmexmon_init() {
         (int (*)(struct nl_sock *, struct nl_msg *))dlsym(
             REAL_LIBNL, "nl_send_auto_complete");
 #endif // CONFIG_LIBNL
+
+  if (!func_read)
+    func_read = (ssize_t (*)(int, void *, size_t))dlsym(REAL_LIBC, "read");
 }
 
 #ifdef CONFIG_LIBNL
@@ -260,6 +290,32 @@ int nl80211_type() {
   nl_cache_free(nl_cache);
   nl_socket_free(nl_sock);
   return _nl80211_type;
+}
+
+// Stability enforcement - called after channel changes for compatible tools
+// This prevents the radio from going "deaf" (waiting for beacon) during scans
+// Also called periodically during handshake capture to keep radio awake
+static void nex_enforce_stability(void) {
+    // Skip for aireplay-ng - causes crashes during deauth floods
+    if (is_aireplay) return;
+    
+    int val;
+    
+    // WLC_SET_PM = 0 (Constantly Awake Mode - CAM)
+    val = 0;
+    nex_ioctl(nexio, WLC_SET_PM, &val, 4, true);
+    
+    // WLC_SET_WAKE = 1 (Force wake, prevent sleep)
+    val = 1;
+    nex_ioctl(nexio, WLC_SET_WAKE, &val, 4, true);
+    
+    // WLC_SET_SCANSUPPRESS = 1 (Suppress background scans)
+    val = 1;
+    nex_ioctl(nexio, WLC_SET_SCANSUPPRESS, &val, 4, true);
+    
+    // WLC_SET_PROMISC = 1 (Promiscuous Mode)
+    val = 1;
+    nex_ioctl(nexio, WLC_SET_PROMISC, &val, 4, true);
 }
 
 int handle_nl_msg(struct nl_msg *msg) {
@@ -352,9 +408,16 @@ int handle_nl_msg(struct nl_msg *msg) {
       ctl_sb = WL_CHANSPEC_CTL_SB_LLL;
     }
 
-    if (chan)
+    if (chan) {
       // nex_set_channel_simple(chan);
-      return nex_set_channel_full(chan, band, bandwidth, ctl_sb);
+      int ret = nex_set_channel_full(chan, band, bandwidth, ctl_sb);
+      // Enforce stability after channel hop (for Kismet/hcxdumptool)
+      // This prevents the radio from going "deaf" after switching channels
+      if (is_kismet || is_hcxdumptool) {
+        nex_enforce_stability();
+      }
+      return ret;
+    }
   }
   if (ghdr->cmd == NL80211_CMD_SET_INTERFACE) {
     if (!attr[NL80211_ATTR_IFINDEX])
@@ -379,6 +442,19 @@ int handle_nl_msg(struct nl_msg *msg) {
 // for now
 int nl_send_auto_complete(struct nl_sock *sk, struct nl_msg *msg) {
   int ret;
+  struct nlmsghdr *nlh = nlmsg_hdr(msg);
+  struct genlmsghdr *ghdr = nlmsg_data(nlh);
+
+  // Intercept NL80211_CMD_SET_INTERFACE for Kismet/hcxdumptool
+  // These tools try to set monitor mode via netlink, which the Android kernel rejects
+  // We fake a success response to prevent them from aborting
+  if ((is_kismet || is_hcxdumptool) &&
+      nlh->nlmsg_type == nl80211_type() &&
+      ghdr->cmd == NL80211_CMD_SET_INTERFACE) {
+    // Return fake success (simulate the bytes that would have been sent)
+    // This prevents EINVAL/EOPNOTSUPP errors from crashing the tools
+    return nlmsg_total_size(nlmsg_datalen(nlh));
+  }
 
   ret = func_nl_send_auto_complete(sk, msg);
 
@@ -487,6 +563,13 @@ int ioctl(int fd, request_t request, ...) {
         nex_ioctl(nexio, WLC_SET_PROMISC, &promisc, 4, true);
         int pm = 0; // Disable Power Management (CAM)
         nex_ioctl(nexio, WLC_SET_PM, &pm, 4, true);
+        
+        // For Kismet: Always return success even if the ioctl fails
+        // Kismet uses this legacy path and will abort if it gets an error
+        if (is_kismet) {
+          nex_ioctl(nexio, WLC_SET_MONITOR, &buf, 4, true);
+          return 0; // Force success for Kismet
+        }
       } else {
         buf = MONITOR_DISABLED;
       }
@@ -626,6 +709,7 @@ static char domain_types[][16] = {
 
 int socket_to_type[65536] = {0};
 char bound_to_correct_if[65536] = {0};
+char socket_is_netlink[65536] = {0};  // Track netlink sockets for read() hook
 
 int socket(int domain, int type, int protocol) {
   int ret;
@@ -633,8 +717,11 @@ int socket(int domain, int type, int protocol) {
   ret = func_socket(domain, type, protocol);
 
   // save the socket type
-  if (ret < sizeof(socket_to_type) / sizeof(socket_to_type[0]))
+  if (ret > 0 && ret < sizeof(socket_to_type) / sizeof(socket_to_type[0])) {
     socket_to_type[ret] = type;
+    // Track netlink sockets for the read() error suppression hook
+    socket_is_netlink[ret] = (domain == AF_NETLINK) ? 1 : 0;
+  }
 
   // if ((type - 1 < sizeof(sock_types)/sizeof(sock_types[0])) && (domain - 1 <
   // sizeof(domain_types)/sizeof(domain_types[0])))
@@ -789,6 +876,15 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
         ts.tv_sec = 0;
         ts.tv_nsec = inject_delay_ns;
         nanosleep(&ts, NULL);
+    }
+
+    // Periodic stability enforcement during injection
+    // Prevents radio from going to sleep during long capture sessions
+    // Every 50 frames, re-enforce wake state (not for aireplay - it's too fast)
+    static int inject_counter = 0;
+    if (!is_aireplay && ++inject_counter >= 50) {
+        inject_counter = 0;
+        nex_enforce_stability();
     }
 
     ret = len;
@@ -995,4 +1091,39 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
     ret = func_sendmmsg(sockfd, msgvec, vlen, flags);
   }
   return ret;
+}
+
+// read() hook for error suppression
+// Kismet and hcxdumptool read from netlink sockets to get interface stats
+// When the kernel returns EOPNOTSUPP (-95) or EINVAL (-22), we rewrite to success
+// This prevents tools from aborting due to "Driver does not support X" errors
+// CRITICAL: Only apply to netlink sockets to avoid corrupting packet capture data
+ssize_t read(int fd, void *buf, size_t count) {
+    if (!func_read)
+        func_read = (ssize_t (*)(int, void *, size_t))dlsym(REAL_LIBC, "read");
+    
+    ssize_t ret = func_read(fd, buf, count);
+    
+    // Error suppression ONLY for Kismet/hcxdumptool reading from NETLINK sockets
+    // Do NOT apply to AF_PACKET sockets used for packet capture - this would corrupt data
+    if ((is_kismet || is_hcxdumptool) && ret > 0 && buf && 
+        fd > 0 && fd < (int)(sizeof(socket_is_netlink) / sizeof(socket_is_netlink[0])) &&
+        socket_is_netlink[fd] &&  // ONLY netlink sockets!
+        ret >= (ssize_t)sizeof(struct nlmsghdr)) {
+        struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+        
+        // Check for netlink error messages (NLMSG_ERROR type)
+        if (nlh->nlmsg_type == NLMSG_ERROR && 
+            ret >= (ssize_t)(sizeof(struct nlmsghdr) + sizeof(struct nlmsgerr))) {
+            struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nlh);
+            
+            // Suppress EOPNOTSUPP (-95) and EINVAL (-22)
+            // These occur when the kernel doesn't support the requested operation
+            if (err->error == -95 || err->error == -22) {
+                err->error = 0; // Rewrite to success
+            }
+        }
+    }
+    
+    return ret;
 }
