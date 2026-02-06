@@ -151,7 +151,7 @@ static void _libmexmon_init() {
   // Radio stabilization delay - helps when switching between attacks
   // When wifite spawns a new attack process, this gives the firmware
   // time to recover from the previous attack's state
-  struct timespec init_delay = {.tv_sec = 0, .tv_nsec = 300000000}; // 300ms
+  struct timespec init_delay = {.tv_sec = 0, .tv_nsec = 10000000}; // 10ms
   nanosleep(&init_delay, NULL);
 
   // Performance Optimization: Configurable Delay & Smart Auto-Detect
