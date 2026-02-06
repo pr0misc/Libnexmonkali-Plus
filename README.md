@@ -26,9 +26,21 @@ The Fix: We hooked the SIOCSIWFREQ (Set Frequency) call to strictly re-enforce W
 5. Smart Speed (Auto-Optimization)
 The library now includes "Smart Process Detection". It inspects the tool name running and automatically sets the optimal injection delay to protect your device:
  * `reaver`, `bully`: **5ms** (Max Speed for WPS attacks)
+ * `hcxdumptool`: **10ms** (Aggressive capture speed)
  * `aireplay-ng`: **15ms** (High Speed for deauths)
+ * `kismet`: **20ms** (Balanced for scanning)
  * `airodump-ng`: **40ms** (Balanced for scanning)
  * `*` (Default): **70ms** (Safe Mode for stability)
+
+6. Kismet & hcxdumptool Compatibility
+Full support for advanced capture tools:
+ * **Netlink Interception**: Fakes monitor mode success to prevent EINVAL/EOPNOTSUPP errors
+ * **Error Suppression**: Suppresses kernel errors for unsupported operations
+ * **Radio Stability**: Enforces WLC_SET_PM=0, WLC_SET_WAKE=1, WLC_SET_SCANSUPPRESS=1 to keep radio awake
+ * **Radiotap Preservation**: hcxdumptool's radiotap headers are preserved for full injection control
+
+7. Attack Switching Stability
+Added 300ms radio stabilization delay at initialization to prevent stuck attacks when switching between tools (e.g., wifite Pixie-Dust → NULL PIN).
 
 🛠️ Build & Install
 You will need an aarch64 cross-compiler or a native build environment (Termux/NetHunter).
