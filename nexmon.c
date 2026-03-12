@@ -128,18 +128,20 @@ static int (*func_sendmmsg)(int, struct mmsghdr *, unsigned int, int) = NULL;
 static int (*func_ioctl)(int, request_t, void *) = NULL;
 static int (*func_socket)(int, int, int) = NULL;
 static int (*func_bind)(int, const struct sockaddr *, int) = NULL;
-static int (*func_write)(int, const void *, size_t) = NULL;
+static ssize_t (*func_write)(int, const void *, size_t) = NULL;
+static int (*func_close)(int) = NULL;
 #ifdef CONFIG_LIBNL
 static int (*func_nl_send_auto_complete)(struct nl_sock *,
                                          struct nl_msg *) = NULL;
 #endif // CONFIG_LIBNL
 
-static long inject_delay_ns = 70000000; // Default 70ms
+static long inject_delay_ns = 0; // Default: no throttling for maximum throughput
 
 // Process detection flags for tool-specific behavior
 static int is_kismet = 0;
 static int is_hcxdumptool = 0;
 static int is_aireplay = 0;  // Excluded from stability enforcement (causes crashes)
+static int is_reaver_or_bully = 0;
 
 // Additional function pointers for new hooks
 static ssize_t (*func_read)(int, void *, size_t) = NULL;
@@ -148,61 +150,40 @@ static void _libmexmon_init() __attribute__((constructor));
 static void _libmexmon_init() {
   nexio = nex_init_ioctl(ifname);
 
-  // Radio stabilization delay - helps when switching between attacks
-  // When wifite spawns a new attack process, this gives the firmware
-  // time to recover from the previous attack's state
-  struct timespec init_delay = {.tv_sec = 0, .tv_nsec = 10000000}; // 10ms
-  nanosleep(&init_delay, NULL);
-
-  // Performance Optimization: Configurable Delay & Smart Auto-Detect
-  // Priority 1: User Override via environment variable
+  // Performance Optimization: configurable delay only via env.
+  // Keep the default at zero to avoid implicit throttling.
   const char *delay_env = getenv("NEXMON_DELAY");
   if (delay_env) {
       long val = atol(delay_env);
       if (val >= 0) {
           inject_delay_ns = val;
       }
-  } else {
-      // Priority 2: Smart Auto-Detect based on Process Name
-      char proc_name[256] = {0};
-      FILE *f = fopen("/proc/self/comm", "r");
-      if (f) {
-          fread(proc_name, 1, sizeof(proc_name)-1, f);
-          fclose(f);
-          // Strip newline
-          char *nl = strchr(proc_name, '\n');
-          if (nl) *nl = 0;
+  }
 
-          // Reaver and Bully: 5ms (Aggressive but with a tiny breathing room)
-          if (strstr(proc_name, "reaver") || strstr(proc_name, "bully")) {
-              inject_delay_ns = 5000000; // 5ms
-              // fprintf(stderr, "LIBNEXMON: Auto-detected %s - Setting MAX SPEED (5ms)\n", proc_name);
-          }
-          // Aireplay-ng: 15ms (High Speed)
-          else if (strstr(proc_name, "aireplay")) {
-              is_aireplay = 1;  // Flag to exclude from stability enforcement
-              inject_delay_ns = 15000000; // 15ms
-              // fprintf(stderr, "LIBNEXMON: Auto-detected %s - Setting HIGH SPEED (15ms)\n", proc_name);
-          }
-          // Airodump-ng: 40ms (Moderate Speed for active scanning)
-          else if (strstr(proc_name, "airodump")) {
-             inject_delay_ns = 40000000; // 40ms
-             // fprintf(stderr, "LIBNEXMON: Auto-detected %s - Setting MONITOR SPEED (40ms)\n", proc_name);
-          }
-          // Kismet: 20ms (Balanced for scanning, needs stability enforcement)
-          else if (strstr(proc_name, "kismet")) {
-              is_kismet = 1;
-              inject_delay_ns = 20000000; // 20ms
-              // fprintf(stderr, "LIBNEXMON: Auto-detected Kismet - Setting SCAN SPEED (20ms)\n");
-          }
-          // hcxdumptool: 10ms (Aggressive capture, needs stability enforcement)
-          else if (strstr(proc_name, "hcxdumptool")) {
-              is_hcxdumptool = 1;
-              inject_delay_ns = 10000000; // 10ms
-              // fprintf(stderr, "LIBNEXMON: Auto-detected hcxdumptool - Setting CAPTURE SPEED (10ms)\n");
-          }
-          // Default for unknown tools remains 70ms (Safe Mode)
-      }
+  // Process detection remains for tool-specific compatibility behavior.
+  char proc_name[256] = {0};
+  FILE *f = fopen("/proc/self/comm", "r");
+  if (f) {
+    fread(proc_name, 1, sizeof(proc_name) - 1, f);
+    fclose(f);
+    char *nl = strchr(proc_name, '\n');
+    if (nl)
+      *nl = 0;
+
+    if (strstr(proc_name, "reaver") || strstr(proc_name, "bully"))
+      is_reaver_or_bully = 1;
+    else if (strstr(proc_name, "aireplay"))
+      is_aireplay = 1;
+    else if (strstr(proc_name, "kismet"))
+      is_kismet = 1;
+    else if (strstr(proc_name, "hcxdumptool"))
+      is_hcxdumptool = 1;
+  }
+
+  // Firmware-crash guard: if user did not set NEXMON_DELAY explicitly,
+  // keep a tiny pacing delay for known aggressive TX tools.
+  if (!delay_env && (is_aireplay || is_reaver_or_bully)) {
+    inject_delay_ns = 2000000; // 2ms
   }
 
   if (!func_ioctl)
@@ -216,7 +197,10 @@ static void _libmexmon_init() {
         (int (*)(int, const struct sockaddr *, int))dlsym(REAL_LIBC, "bind");
 
   if (!func_write)
-    func_write = (int (*)(int, const void *, size_t))dlsym(REAL_LIBC, "write");
+    func_write = (ssize_t (*)(int, const void *, size_t))dlsym(REAL_LIBC, "write");
+
+  if (!func_close)
+    func_close = (int (*)(int))dlsym(REAL_LIBC, "close");
 
   if (!func_sendto)
     func_sendto =
@@ -741,7 +725,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   if_indextoname(sll->sll_ifindex, sll_ifname);
 
   if ((sockfd < sizeof(bound_to_correct_if) / sizeof(bound_to_correct_if[0])) &&
-      !strncmp(ifname, sll_ifname, sizeof(ifname)))
+      !strncmp(ifname, sll_ifname, strlen(ifname)))
     bound_to_correct_if[sockfd] = 1;
 
   // printf("LIBNEXMON: %d = %s(%d, 0x%p, %d) sll_ifindex=%d ifname=%s\n", ret,
@@ -750,12 +734,45 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return ret;
 }
 
+int close(int fd) {
+  if (!func_close)
+    func_close = (int (*)(int))dlsym(REAL_LIBC, "close");
+
+  if (fd > 0 && fd < (int)(sizeof(socket_to_type) / sizeof(socket_to_type[0]))) {
+    socket_to_type[fd] = 0;
+    bound_to_correct_if[fd] = 0;
+    socket_is_netlink[fd] = 0;
+  }
+
+  return func_close(fd);
+}
+
 struct inject_frame {
   unsigned short len;
   unsigned char pad;
   unsigned char type;
   char data[];
 };
+
+static int is_valid_dest_if(const struct sockaddr *dest_addr, socklen_t addrlen) {
+  if (!dest_addr || addrlen < (socklen_t)sizeof(struct sockaddr_ll))
+    return 0;
+
+  const struct sockaddr_ll *sll = (const struct sockaddr_ll *)dest_addr;
+  if (sll->sll_family != AF_PACKET)
+    return 0;
+
+  return (sll->sll_ifindex == if_nametoindex(ifname));
+}
+
+static inline void nex_apply_inject_delay(void) {
+  if (inject_delay_ns > 0) {
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = inject_delay_ns;
+    nanosleep(&ts, NULL);
+  }
+}
 
 // Optimization: Thread-local static buffer to avoid malloc/free overhead per packet
 // Max 802.11 frame size is ~2312 bytes, so 4096 is practically safe.
@@ -773,17 +790,19 @@ ssize_t write(int fd, const void *buf, size_t count) {
     inject = 1;
   }
 
-  // Method 2: Unbound raw socket (fallback for aireplay-ng deauth)
+  // Method 2: Unbound raw socket fallback for known tx tools only.
   // Some versions of aireplay-ng don't bind() before write()
-  // On monitor mode devices, raw socket writes are almost always injection
+  // Keep this path restricted to avoid accidental injection of unrelated payloads
+  // that can produce phantom clients in scanners.
   if (!inject && (fd > 2) &&
       (fd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
-      (socket_to_type[fd] == SOCK_RAW)) {
+      (socket_to_type[fd] == SOCK_RAW) &&
+      (is_aireplay || is_reaver_or_bully)) {
     inject = 1;
   }
 
   // Safety: If buf is NULL or length is 0, skip injection (handles mmap flushes)
-  if (inject && (!buf || count == 0)) {
+  if (inject && (!buf || count < 24)) {
       inject = 0;
   }
 
@@ -791,6 +810,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
     if ((count + sizeof(struct inject_frame)) > MAX_INJECT_BUF) {
        // Fallback for oversized packets (rare)
        struct inject_frame *buf_dup = (struct inject_frame *)malloc(count + sizeof(struct inject_frame));
+       if (!buf_dup) {
+         return func_write(fd, buf, count);
+       }
        buf_dup->len = count + sizeof(struct inject_frame);
        buf_dup->pad = 0;
        buf_dup->type = 1;
@@ -808,12 +830,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
     }
 
     // Configurable rate-limiting
-    if (inject_delay_ns > 0) {
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = inject_delay_ns;
-        nanosleep(&ts, NULL);
-    }
+    nex_apply_inject_delay();
 
     ret = count;
   } else {
@@ -843,19 +860,24 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
   if (!inject && dest_addr && (sockfd > 2) &&
       (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
       (socket_to_type[sockfd] == SOCK_RAW)) {
-    struct sockaddr_ll *sll = (struct sockaddr_ll *)dest_addr;
-    if (sll->sll_ifindex == if_nametoindex(ifname)) {
+    if (is_valid_dest_if(dest_addr, addrlen)) {
       inject = 1;
     }
   }
 
   if (inject) {
+    if (!buf || len < 24)
+      return func_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+
     // fprintf(stderr, "sendto(sockfd=%d) -> INJECTION PATH\n", sockfd);
 
     size_t frame_len = len + sizeof(struct inject_frame);
 
     if (frame_len > MAX_INJECT_BUF) {
         struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+        if (!buf_dup) {
+          return func_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+        }
         buf_dup->len = frame_len;
         buf_dup->pad = 0;
         buf_dup->type = 1;
@@ -871,12 +893,7 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
         nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
     }
 
-    if (inject_delay_ns > 0) {
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = inject_delay_ns;
-        nanosleep(&ts, NULL);
-    }
+    nex_apply_inject_delay();
 
     // Periodic stability enforcement during injection
     // Prevents radio from going to sleep during long capture sessions
@@ -912,8 +929,8 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
   if (!inject && msg->msg_name && (sockfd > 2) &&
       (sockfd < sizeof(socket_to_type) / sizeof(socket_to_type[0])) &&
       (socket_to_type[sockfd] == SOCK_RAW)) {
-    struct sockaddr_ll *sll = (struct sockaddr_ll *)msg->msg_name;
-    if (sll->sll_ifindex == if_nametoindex(ifname)) {
+    if (is_valid_dest_if((const struct sockaddr *)msg->msg_name,
+                         (socklen_t)msg->msg_namelen)) {
       inject = 1;
     }
   }
@@ -932,8 +949,14 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
 
     size_t frame_len = total_len + sizeof(struct inject_frame);
 
+    if (total_len < 24)
+      return func_sendmsg(sockfd, msg, flags);
+
     if (frame_len > MAX_INJECT_BUF) {
         struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+        if (!buf_dup) {
+          return func_sendmsg(sockfd, msg, flags);
+        }
         buf_dup->len = frame_len;
         buf_dup->pad = 0;
         buf_dup->type = 1;
@@ -959,12 +982,7 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
         nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
     }
 
-    if (inject_delay_ns > 0) {
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = inject_delay_ns;
-        nanosleep(&ts, NULL);
-    }
+    nex_apply_inject_delay();
 
     ret = total_len;
   } else {
@@ -987,10 +1005,16 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
   }
 
   if (inject) {
+    if (!buf || len < 24)
+      return func_send(sockfd, buf, len, flags);
+
     size_t frame_len = len + sizeof(struct inject_frame);
     
     if (frame_len > MAX_INJECT_BUF) {
         struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+        if (!buf_dup) {
+          return func_send(sockfd, buf, len, flags);
+        }
         buf_dup->len = frame_len;
         buf_dup->pad = 0;
         buf_dup->type = 1;
@@ -1006,12 +1030,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
         nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
     }
 
-    if (inject_delay_ns > 0) {
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = inject_delay_ns;
-        nanosleep(&ts, NULL);
-    }
+    nex_apply_inject_delay();
 
     ret = len;
   } else {
@@ -1049,8 +1068,16 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
 
         size_t frame_len = total_len + sizeof(struct inject_frame);
 
+        if (total_len < 24) {
+          msgvec[i].msg_len = 0;
+          continue;
+        }
+
         if (frame_len > MAX_INJECT_BUF) {
             struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+            if (!buf_dup) {
+              return func_sendmmsg(sockfd, msgvec, vlen, flags);
+            }
             buf_dup->len = frame_len;
             buf_dup->pad = 0;
             buf_dup->type = 1;
@@ -1075,15 +1102,11 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
             nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
         }
 
+        // Apply delay per message in the batch to avoid firmware bursts.
+        nex_apply_inject_delay();
+
         // Allow checking result for each, or just count as sent
         msgvec[i].msg_len = total_len;
-    }
-
-    if (inject_delay_ns > 0) {
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = inject_delay_ns;
-        nanosleep(&ts, NULL);
     }
 
     ret = vlen;

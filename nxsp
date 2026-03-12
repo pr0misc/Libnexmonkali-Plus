@@ -1,7 +1,7 @@
 #!/bin/bash
 # nxsp - Helper script to run any tool with Libnexmonkali-Plus
 # Usage: 
-#   nxsp load              -> Spawns a new shell with library loaded (Default 70ms)
+#   nxsp load              -> Spawns a new shell with library loaded (Default 0ms)
 #   nxsp unload            -> Spawns a new shell with library UNLOADED
 #   nxsp <delay> <cmd> ... -> Runs specific command with custom delay (0-X ms)
 
@@ -24,11 +24,11 @@ MODE="$1"
 
 if [ "$MODE" == "load" ]; then
     echo "[*] nxsp: Spawning new shell with Libnexmonkali loaded..."
-    echo "[*] Default Delay: 70ms (Safe Mode). Use 'export NEXMON_DELAY=0' to override."
+    echo "[*] Default Delay: 0ms (Max Throughput). Use 'export NEXMON_DELAY=<ns>' to throttle if needed."
     echo "[*] Type 'exit' or use 'nxsp unload' to leave this mode."
     export LD_PRELOAD=$LIBPATH
-    # Default to safe mode if not set
-    if [ -z "$NEXMON_DELAY" ]; then export NEXMON_DELAY=70000000; fi
+    # Default to max-throughput mode if not set
+    if [ -z "$NEXMON_DELAY" ]; then export NEXMON_DELAY=0; fi
     exec $SHELL
 
 elif [ "$MODE" == "unload" ]; then

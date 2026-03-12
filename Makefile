@@ -1,10 +1,30 @@
-CC = aarch64-linux-gnu-gcc
-AR = aarch64-linux-gnu-ar
+ARCH ?= arm64
+
+ifeq ($(ARCH),armhf)
+CROSS_COMPILE ?= arm-linux-gnueabihf-
+else
+CROSS_COMPILE ?= aarch64-linux-gnu-
+endif
+
+ifeq ($(origin CC), default)
+CC := $(CROSS_COMPILE)gcc
+endif
+
+ifeq ($(origin AR), default)
+AR := $(CROSS_COMPILE)ar
+endif
 
 CFLAGS = -std=c99 -I./
 LDFLAGS = -shared -fPIC -ldl libnexio.a
 
 all: libnexio.a libnexmonkali.so
+
+.PHONY: arm64 armhf
+arm64:
+	$(MAKE) ARCH=arm64
+
+armhf:
+	$(MAKE) ARCH=armhf
 
 libnexmonkali.so: libnexio.a nexmon.c
 	$(CC) -o $@ -std=c99 -I./ -I/usr/include/libnl3 nexmon.c -shared -fPIC -ldl libnexio.a

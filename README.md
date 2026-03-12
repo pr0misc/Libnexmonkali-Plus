@@ -16,21 +16,18 @@ All trapped packets are automatically encapsulated and injected via the custom B
 2. Reliable Handshake Capture (Power Management Fix)
 The Problem: Standard firmware often puts the Wi-Fi chip to sleep while waiting for DTIM beacons, causing it to miss EAPOL M2/M4 packets, resulting in incomplete 4-way handshake captures.
 The Fix: We inject an explicit WLC_SET_PM = 0 (Constantly Awake Mode) command during initialization. This forces the radio to stay active, ensuring 100% frame capture rate during WPA handshakes.
-3. Extended Range (TX Power Boost)
-To maximize signal reach for both injection and reception, this library issues an automatic WLC_SET_TXPWR command (configured to 500) upon interface initialization. This overrides default power-saving regulatory limits.
+3. Extended Range (TX Power)
+TX power behavior is firmware/device dependent. This fork focuses on monitor/injection stability and compatibility; apply TX power changes explicitly with your preferred tooling if needed.
 
 4. Channel Switching Stability (Deafness Fix)
 The Problem: On some firmware versions (like the S10 BCM4375B1), switching channels—whether manually or via tools like Wifite—causes the Wi-Fi chip to reset its Power Management state to "Enabled" (Sleep Mode). This leads to the interface going "deaf" (missing beacons/packets) immediately after a channel hop, causing tools to hang waiting for targets.
 The Fix: We hooked the SIOCSIWFREQ (Set Frequency) call to strictly re-enforce WLC_SET_PM = 0 (Wake) and WLC_SET_PROMISC = 1 (Promiscuous) every single time the channel changes. This ensures the radio never sleeps during multi-channel attacks or scanning.
 
-5. Smart Speed (Auto-Optimization)
-The library now includes "Smart Process Detection". It inspects the tool name running and automatically sets the optimal injection delay to protect your device:
- * `reaver`, `bully`: **5ms** (Max Speed for WPS attacks)
- * `hcxdumptool`: **10ms** (Aggressive capture speed)
- * `aireplay-ng`: **15ms** (High Speed for deauths)
- * `kismet`: **20ms** (Balanced for scanning)
- * `airodump-ng`: **40ms** (Balanced for scanning)
- * `*` (Default): **70ms** (Safe Mode for stability)
+5. Smart Speed (Manual Control)
+The library now defaults to maximum throughput with no automatic throttling:
+ * `*` (Default): **0ms**
+ * Optional: set `NEXMON_DELAY` (nanoseconds) when you need pacing for specific tools/chip stability.
+ * Safety guard: if `NEXMON_DELAY` is unset, aggressive TX tools (`aireplay-ng`, `reaver`, `bully`) get a tiny built-in 2ms pacing to reduce firmware crash risk.
 
 6. Kismet & hcxdumptool Compatibility
 Full support for advanced capture tools:
@@ -40,15 +37,18 @@ Full support for advanced capture tools:
  * **Radiotap Preservation**: hcxdumptool's radiotap headers are preserved for full injection control
 
 7. Attack Switching Stability
-Added 300ms radio stabilization delay at initialization to prevent stuck attacks when switching between tools (e.g., wifite Pixie-Dust → NULL PIN).
+The library includes runtime stability enforcement (PM/WAKE/PROMISC/SCANSUPPRESS) during monitor/injection workflows to reduce "deaf" states during attack switching and channel changes.
 
 🛠️ Build & Install
-You will need an aarch64 cross-compiler or a native build environment (Termux/NetHunter).
+You will need an arm64 or armhf cross-compiler (or a native build environment such as Termux/NetHunter).
 
 1. Build & Install
 ```bash
 # Clean, Compile, and Install to /usr/bin/nxsp
 make clean && make && sudo make install
+
+# For armhf toolchains/devices
+make clean && make ARCH=armhf && sudo make install
 ```
 
 💻 Usage Guide
@@ -64,7 +64,7 @@ Step 2: Run Tools (NetHunter Side)
 Use `nxsp` to run tools. You have two options:
 
 **Option A: Single Command (Recommended)**
-Run explicit commands with "Smart Speed" (auto) or custom delay:
+Run explicit commands with default max throughput (or custom delay):
 ```bash
 # Auto-detect (Best Speed)
 nxsp 0 reaver -i wlan0 -b ...
@@ -81,7 +81,7 @@ nxsp load
 
 # Check if it's working
 echo $LD_PRELOAD  # Should show /usr/lib/libnexmonkali.so
-echo $NEXMON_DELAY # Should be 70000000 (70ms default)
+echo $NEXMON_DELAY # Should be 0 (default max-throughput mode)
 
 # Run tools normally
 reaver -i wlan0 ...

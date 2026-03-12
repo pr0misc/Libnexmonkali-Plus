@@ -142,6 +142,11 @@ static int __nex_driver_udp(struct nexio *nexio, struct nex_ioctl *ioc) {
       (struct nexudp_ioctl_header *)malloc(frame_len);
   int ret = 0;
 
+  if (!frame) {
+    fprintf(stderr, "ERR (%s): out of memory\n", __FUNCTION__);
+    return -1;
+  }
+
   memcpy(&frame->nexudphdr.nex, "NEX", 3);
   frame->nexudphdr.type = NEXUDP_IOCTL;
   frame->nexudphdr.securitycookie = nexio->securitycookie;
@@ -182,6 +187,10 @@ static int __nex_driver_netlink(struct nexio *nexio, struct nex_ioctl *ioc) {
   struct msghdr msg = {0};
 
   struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(frame_len));
+  if (!nlh) {
+    fprintf(stderr, "ERR (%s): out of memory\n", __FUNCTION__);
+    return -1;
+  }
   memset(nlh, 0, NLMSG_SPACE(frame_len));
   nlh->nlmsg_len = NLMSG_SPACE(frame_len);
   nlh->nlmsg_pid = getpid();
@@ -265,9 +274,18 @@ int nex_ioctl(struct nexio *nexio, int cmd, void *buf, int len, bool set) {
 
 struct nexio *nex_init_ioctl(const char *ifname) {
   struct nexio *nexio = (struct nexio *)malloc(sizeof(struct nexio));
+  if (!nexio) {
+    fprintf(stderr, "ERR (%s): out of memory\n", __FUNCTION__);
+    return NULL;
+  }
   memset(nexio, 0, sizeof(struct nexio));
 
   nexio->ifr = (struct ifreq *)malloc(sizeof(struct ifreq));
+  if (!nexio->ifr) {
+    fprintf(stderr, "ERR (%s): out of memory\n", __FUNCTION__);
+    free(nexio);
+    return NULL;
+  }
   memset(nexio->ifr, 0, sizeof(struct ifreq));
   snprintf(nexio->ifr->ifr_name, sizeof(nexio->ifr->ifr_name), "%s", ifname);
 
