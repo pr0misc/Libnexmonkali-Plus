@@ -120,6 +120,13 @@ static struct nexio *nexio = NULL;
 
 static const char *ifname = "wlan0";
 
+// Injection methods
+#define INJECT_IOCTL       0   // bcmdhd driver (e.g., S10, S21) uses NEX_INJECT_FRAME (408)
+#define INJECT_RAW_SOCKET  1   // brcmfmac driver (e.g., TicWatch, RPi) uses wl_send_hook passthrough
+
+// Detected injection method
+static int current_inject_method = INJECT_IOCTL;
+
 static int (*func_sendto)(int, const void *, size_t, int,
                           const struct sockaddr *, socklen_t) = NULL;
 static ssize_t (*func_sendmsg)(int, const struct msghdr *, int) = NULL;
@@ -146,12 +153,40 @@ static ssize_t (*func_read)(int, void *, size_t) = NULL;
 
 static void _libmexmon_init() __attribute__((constructor));
 static void _libmexmon_init() {
+  // Allow interface name override via environment (default: wlan0)
+  const char *iface_env = getenv("NEXMON_IFACE");
+  if (iface_env && iface_env[0]) {
+      ifname = iface_env;
+  }
+
   nexio = nex_init_ioctl(ifname);
+
+  // Universal Driver Detection
+  // Determine injection method based on which driver is loaded
+  {
+      FILE *f_brcmfmac = fopen("/sys/module/brcmfmac/initstate", "r");
+      FILE *f_bcmdhd = fopen("/sys/module/bcmdhd/initstate", "r");
+      
+      if (f_brcmfmac) {
+          current_inject_method = INJECT_RAW_SOCKET;
+          fclose(f_brcmfmac);
+      } else if (f_bcmdhd) {
+          current_inject_method = INJECT_IOCTL;
+          fclose(f_bcmdhd);
+      } else {
+          // Fallback based on architecture defines from Makefile
+#if defined(ARCH_ARMHF)
+          current_inject_method = INJECT_RAW_SOCKET; // Assume brcmfmac pattern for armhf
+#else
+          current_inject_method = INJECT_IOCTL;      // Assume bcmdhd pattern for aarch64
+#endif
+      }
+  }
 
   // Radio stabilization delay - helps when switching between attacks
   // When wifite spawns a new attack process, this gives the firmware
   // time to recover from the previous attack's state
-  struct timespec init_delay = {.tv_sec = 0, .tv_nsec = 10000000}; // 10ms
+  struct timespec init_delay = {.tv_sec = 0, .tv_nsec = (current_inject_method == INJECT_RAW_SOCKET) ? 20000000 : 10000000};
   nanosleep(&init_delay, NULL);
 
   // Performance Optimization: Configurable Delay & Smart Auto-Detect
@@ -203,6 +238,12 @@ static void _libmexmon_init() {
           }
           // Default for unknown tools remains 70ms (Safe Mode)
       }
+  }
+
+  // Raw socket injection tuning (often constrained armhf chips like TicWatch/RPi)
+  // Increase default delay if user hasn't overridden and no tool auto-detected
+  if (current_inject_method == INJECT_RAW_SOCKET && !delay_env && inject_delay_ns == 70000000) {
+      inject_delay_ns = 100000000; // 100ms default for constrained chips
   }
 
   if (!func_ioctl)
@@ -295,6 +336,8 @@ int nl80211_type() {
 // Stability enforcement - called after channel changes for compatible tools
 // This prevents the radio from going "deaf" (waiting for beacon) during scans
 // Also called periodically during handshake capture to keep radio awake
+// Note: Limited firmware variants may not support WLC_SET_WAKE/SCANSUPPRESS but errors are
+// silently ignored by nex_ioctl (returns -1), so this is safe across all chips.
 static void nex_enforce_stability(void) {
     // Skip for aireplay-ng - causes crashes during deauth floods
     if (is_aireplay) return;
@@ -306,10 +349,12 @@ static void nex_enforce_stability(void) {
     nex_ioctl(nexio, WLC_SET_PM, &val, 4, true);
     
     // WLC_SET_WAKE = 1 (Force wake, prevent sleep)
+    // May return error on some variants - that's OK, silently ignored
     val = 1;
     nex_ioctl(nexio, WLC_SET_WAKE, &val, 4, true);
     
     // WLC_SET_SCANSUPPRESS = 1 (Suppress background scans)
+    // May return error on some variants - that's OK, silently ignored
     val = 1;
     nex_ioctl(nexio, WLC_SET_SCANSUPPRESS, &val, 4, true);
     
@@ -788,23 +833,33 @@ ssize_t write(int fd, const void *buf, size_t count) {
   }
 
   if (inject) {
-    if ((count + sizeof(struct inject_frame)) > MAX_INJECT_BUF) {
-       // Fallback for oversized packets (rare)
-       struct inject_frame *buf_dup = (struct inject_frame *)malloc(count + sizeof(struct inject_frame));
-       buf_dup->len = count + sizeof(struct inject_frame);
-       buf_dup->pad = 0;
-       buf_dup->type = 1;
-       memcpy(buf_dup->data, buf, count);
-       nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, count + sizeof(struct inject_frame), true);
-       free(buf_dup);
+    if (current_inject_method == INJECT_RAW_SOCKET) {
+      // Raw socket passthrough (brcmfmac-style): Injection via wl_send_hook in firmware
+      // The firmware intercepts raw socket writes when in monitor mode
+      // and checks for radiotap header (((short *)p->data)[0] == 0)
+      // So we pass through to the real write() syscall
+      ret = func_write(fd, buf, count);
     } else {
-       // Fast Path: Static Buffer
-       struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
-       buf_dup->len = count + sizeof(struct inject_frame);
-       buf_dup->pad = 0;
-       buf_dup->type = 1;
-       memcpy(buf_dup->data, buf, count);
-       nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, count + sizeof(struct inject_frame), true);
+      // IOCTL injection (bcmdhd-style): Injection via NEX_INJECT_FRAME IOCTL
+      if ((count + sizeof(struct inject_frame)) > MAX_INJECT_BUF) {
+         // Fallback for oversized packets (rare)
+         struct inject_frame *buf_dup = (struct inject_frame *)malloc(count + sizeof(struct inject_frame));
+         buf_dup->len = count + sizeof(struct inject_frame);
+         buf_dup->pad = 0;
+         buf_dup->type = 1;
+         memcpy(buf_dup->data, buf, count);
+         nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, count + sizeof(struct inject_frame), true);
+         free(buf_dup);
+      } else {
+         // Fast Path: Static Buffer
+         struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
+         buf_dup->len = count + sizeof(struct inject_frame);
+         buf_dup->pad = 0;
+         buf_dup->type = 1;
+         memcpy(buf_dup->data, buf, count);
+         nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, count + sizeof(struct inject_frame), true);
+      }
+      ret = count;
     }
 
     // Configurable rate-limiting
@@ -815,7 +870,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
         nanosleep(&ts, NULL);
     }
 
-    ret = count;
+    if (current_inject_method != INJECT_RAW_SOCKET) ret = count;
   } else {
     // otherwise write the regular frame to the socket
     ret = func_write(fd, buf, count);
@@ -850,25 +905,30 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
   }
 
   if (inject) {
-    // fprintf(stderr, "sendto(sockfd=%d) -> INJECTION PATH\n", sockfd);
-
-    size_t frame_len = len + sizeof(struct inject_frame);
-
-    if (frame_len > MAX_INJECT_BUF) {
-        struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
-        buf_dup->len = frame_len;
-        buf_dup->pad = 0;
-        buf_dup->type = 1;
-        memcpy(buf_dup->data, buf, len);
-        nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
-        free(buf_dup);
+    if (current_inject_method == INJECT_RAW_SOCKET) {
+      // Raw socket passthrough (brcmfmac-style): pass through to real sendto — firmware wl_send_hook handles injection
+      ret = func_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
     } else {
-        struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
-        buf_dup->len = frame_len;
-        buf_dup->pad = 0;
-        buf_dup->type = 1;
-        memcpy(buf_dup->data, buf, len);
-        nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+      // IOCTL injection (bcmdhd-style): NEX_INJECT_FRAME IOCTL path
+      size_t frame_len = len + sizeof(struct inject_frame);
+
+      if (frame_len > MAX_INJECT_BUF) {
+          struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+          buf_dup->len = frame_len;
+          buf_dup->pad = 0;
+          buf_dup->type = 1;
+          memcpy(buf_dup->data, buf, len);
+          nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+          free(buf_dup);
+      } else {
+          struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
+          buf_dup->len = frame_len;
+          buf_dup->pad = 0;
+          buf_dup->type = 1;
+          memcpy(buf_dup->data, buf, len);
+          nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+      }
+      ret = len;
     }
 
     if (inject_delay_ns > 0) {
@@ -887,7 +947,7 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
         nex_enforce_stability();
     }
 
-    ret = len;
+    if (current_inject_method != INJECT_RAW_SOCKET) ret = len;
   } else {
     // otherwise write the regular frame to the socket
     ret = func_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
@@ -924,39 +984,43 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
   }
 
   if (inject) {
-    // Flatten iovec for injection ioctl
-    size_t total_len = 0;
-    for (size_t i = 0; i < msg->msg_iovlen; i++) {
-      total_len += msg->msg_iov[i].iov_len;
-    }
-
-    size_t frame_len = total_len + sizeof(struct inject_frame);
-
-    if (frame_len > MAX_INJECT_BUF) {
-        struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
-        buf_dup->len = frame_len;
-        buf_dup->pad = 0;
-        buf_dup->type = 1;
-        // Copy data from iov
-        size_t offset = 0;
-        for (size_t i = 0; i < msg->msg_iovlen; i++) {
-           memcpy(buf_dup->data + offset, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
-           offset += msg->msg_iov[i].iov_len;
-        }
-        nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
-        free(buf_dup);
+    if (current_inject_method == INJECT_RAW_SOCKET) {
+      // Raw socket passthrough (brcmfmac-style): pass through to real sendmsg — firmware wl_send_hook handles injection
+      ret = func_sendmsg(sockfd, msg, flags);
     } else {
-        struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
-        buf_dup->len = frame_len;
-        buf_dup->pad = 0;
-        buf_dup->type = 1;
-        // Copy data from iov
-        size_t offset = 0;
-        for (size_t i = 0; i < msg->msg_iovlen; i++) {
-           memcpy(buf_dup->data + offset, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
-           offset += msg->msg_iov[i].iov_len;
-        }
-        nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+      // IOCTL injection (bcmdhd-style): Flatten iovec for NEX_INJECT_FRAME IOCTL
+      size_t total_len = 0;
+      for (size_t i = 0; i < msg->msg_iovlen; i++) {
+        total_len += msg->msg_iov[i].iov_len;
+      }
+
+      size_t frame_len = total_len + sizeof(struct inject_frame);
+
+      if (frame_len > MAX_INJECT_BUF) {
+          struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+          buf_dup->len = frame_len;
+          buf_dup->pad = 0;
+          buf_dup->type = 1;
+          size_t offset = 0;
+          for (size_t i = 0; i < msg->msg_iovlen; i++) {
+             memcpy(buf_dup->data + offset, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
+             offset += msg->msg_iov[i].iov_len;
+          }
+          nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+          free(buf_dup);
+      } else {
+          struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
+          buf_dup->len = frame_len;
+          buf_dup->pad = 0;
+          buf_dup->type = 1;
+          size_t offset = 0;
+          for (size_t i = 0; i < msg->msg_iovlen; i++) {
+             memcpy(buf_dup->data + offset, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
+             offset += msg->msg_iov[i].iov_len;
+          }
+          nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+      }
+      ret = total_len;
     }
 
     if (inject_delay_ns > 0) {
@@ -966,7 +1030,8 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
         nanosleep(&ts, NULL);
     }
 
-    ret = total_len;
+    // ret is already set: func_sendmsg return value for BCM43436b0,
+    // or total_len for BCM4375b1 (set inside the else block above)
   } else {
     ret = func_sendmsg(sockfd, msg, flags);
   }
@@ -987,23 +1052,30 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
   }
 
   if (inject) {
-    size_t frame_len = len + sizeof(struct inject_frame);
-    
-    if (frame_len > MAX_INJECT_BUF) {
-        struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
-        buf_dup->len = frame_len;
-        buf_dup->pad = 0;
-        buf_dup->type = 1;
-        memcpy(buf_dup->data, buf, len);
-        nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
-        free(buf_dup);
+    if (current_inject_method == INJECT_RAW_SOCKET) {
+      // Raw socket passthrough (brcmfmac-style): pass through to real send — firmware wl_send_hook handles injection
+      ret = func_send(sockfd, buf, len, flags);
     } else {
-        struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
-        buf_dup->len = frame_len;
-        buf_dup->pad = 0;
-        buf_dup->type = 1;
-        memcpy(buf_dup->data, buf, len);
-        nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+      // IOCTL injection (bcmdhd-style): NEX_INJECT_FRAME IOCTL path
+      size_t frame_len = len + sizeof(struct inject_frame);
+      
+      if (frame_len > MAX_INJECT_BUF) {
+          struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+          buf_dup->len = frame_len;
+          buf_dup->pad = 0;
+          buf_dup->type = 1;
+          memcpy(buf_dup->data, buf, len);
+          nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+          free(buf_dup);
+      } else {
+          struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
+          buf_dup->len = frame_len;
+          buf_dup->pad = 0;
+          buf_dup->type = 1;
+          memcpy(buf_dup->data, buf, len);
+          nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+      }
+      ret = len;
     }
 
     if (inject_delay_ns > 0) {
@@ -1013,7 +1085,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
         nanosleep(&ts, NULL);
     }
 
-    ret = len;
+    if (current_inject_method != INJECT_RAW_SOCKET) ret = len;
   } else {
     ret = func_send(sockfd, buf, len, flags);
   }
@@ -1038,45 +1110,49 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
   }
 
   if (inject) {
-    // Inject each message individually
-    for (unsigned int i = 0; i < vlen; i++) {
-        struct msghdr *msg = &msgvec[i].msg_hdr;
+    if (current_inject_method == INJECT_RAW_SOCKET) {
+      // Raw socket passthrough (brcmfmac-style): pass through to real sendmmsg — firmware wl_send_hook handles injection
+      ret = func_sendmmsg(sockfd, msgvec, vlen, flags);
+    } else {
+      // IOCTL injection (bcmdhd-style): NEX_INJECT_FRAME IOCTL path
+      for (unsigned int i = 0; i < vlen; i++) {
+          struct msghdr *msg = &msgvec[i].msg_hdr;
 
-        size_t total_len = 0;
-        for (size_t j = 0; j < msg->msg_iovlen; j++) {
-            total_len += msg->msg_iov[j].iov_len;
-        }
+          size_t total_len = 0;
+          for (size_t j = 0; j < msg->msg_iovlen; j++) {
+              total_len += msg->msg_iov[j].iov_len;
+          }
 
-        size_t frame_len = total_len + sizeof(struct inject_frame);
+          size_t frame_len = total_len + sizeof(struct inject_frame);
 
-        if (frame_len > MAX_INJECT_BUF) {
-            struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
-            buf_dup->len = frame_len;
-            buf_dup->pad = 0;
-            buf_dup->type = 1;
-            size_t offset = 0;
-            for (size_t j = 0; j < msg->msg_iovlen; j++) {
-                memcpy(buf_dup->data + offset, msg->msg_iov[j].iov_base, msg->msg_iov[j].iov_len);
-                offset += msg->msg_iov[j].iov_len;
-            }
-            nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
-            free(buf_dup);
-        } else {
-            struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
-            buf_dup->len = frame_len;
-            buf_dup->pad = 0;
-            buf_dup->type = 1;
+          if (frame_len > MAX_INJECT_BUF) {
+              struct inject_frame *buf_dup = (struct inject_frame *)malloc(frame_len);
+              buf_dup->len = frame_len;
+              buf_dup->pad = 0;
+              buf_dup->type = 1;
+              size_t offset = 0;
+              for (size_t j = 0; j < msg->msg_iovlen; j++) {
+                  memcpy(buf_dup->data + offset, msg->msg_iov[j].iov_base, msg->msg_iov[j].iov_len);
+                  offset += msg->msg_iov[j].iov_len;
+              }
+              nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+              free(buf_dup);
+          } else {
+              struct inject_frame *buf_dup = (struct inject_frame *) _inject_buf_storage;
+              buf_dup->len = frame_len;
+              buf_dup->pad = 0;
+              buf_dup->type = 1;
+              size_t offset = 0;
+              for (size_t j = 0; j < msg->msg_iovlen; j++) {
+                  memcpy(buf_dup->data + offset, msg->msg_iov[j].iov_base, msg->msg_iov[j].iov_len);
+                  offset += msg->msg_iov[j].iov_len;
+              }
+              nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
+          }
 
-            size_t offset = 0;
-            for (size_t j = 0; j < msg->msg_iovlen; j++) {
-                memcpy(buf_dup->data + offset, msg->msg_iov[j].iov_base, msg->msg_iov[j].iov_len);
-                offset += msg->msg_iov[j].iov_len;
-            }
-            nex_ioctl(nexio, NEX_INJECT_FRAME, buf_dup, frame_len, true);
-        }
-
-        // Allow checking result for each, or just count as sent
-        msgvec[i].msg_len = total_len;
+          msgvec[i].msg_len = total_len;
+      }
+      ret = vlen;
     }
 
     if (inject_delay_ns > 0) {
@@ -1086,7 +1162,7 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
         nanosleep(&ts, NULL);
     }
 
-    ret = vlen;
+    if (current_inject_method != INJECT_RAW_SOCKET) ret = vlen;
   } else {
     ret = func_sendmmsg(sockfd, msgvec, vlen, flags);
   }
