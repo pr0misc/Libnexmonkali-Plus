@@ -1,10 +1,28 @@
-CC = aarch64-linux-gnu-gcc
-AR = aarch64-linux-gnu-ar
+CC_AARCH64 = aarch64-linux-gnu-gcc
+AR_AARCH64 = aarch64-linux-gnu-ar
+CC_ARMHF = arm-linux-gnueabihf-gcc
+AR_ARMHF = arm-linux-gnueabihf-ar
+
+# Default to aarch64
+CC = $(CC_AARCH64)
+AR = $(AR_AARCH64)
 
 CFLAGS = -std=c99 -I./
 LDFLAGS = -shared -fPIC -ldl libnexio.a
 
+# Default target
 all: libnexio.a libnexmonkali.so
+
+# Architecture-specific targets
+aarch64: CC = $(CC_AARCH64)
+aarch64: AR = $(AR_AARCH64)
+aarch64: clean libnexio.a libnexmonkali.so
+	@echo "Built for aarch64 (64-bit ARM)"
+
+armhf: CC = $(CC_ARMHF)
+armhf: AR = $(AR_ARMHF)
+armhf: clean libnexio.a libnexmonkali.so
+	@echo "Built for armhf (32-bit ARM)"
 
 libnexmonkali.so: libnexio.a nexmon.c
 	$(CC) -o $@ -std=c99 -I./ -I/usr/include/libnl3 nexmon.c -shared -fPIC -ldl libnexio.a
@@ -12,6 +30,8 @@ libnexmonkali.so: libnexio.a nexmon.c
 libnexio.a: libnexio.c
 	$(CC) -c libnexio.c
 	$(AR) rcs libnexio.a libnexio.o
+
+.PHONY: all aarch64 armhf clean install uninstall
 
 clean:
 	rm -f libnexmonkali.so libnexio.a libnexio.o
