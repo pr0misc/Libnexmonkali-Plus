@@ -153,7 +153,10 @@ static int is_aireplay = 0;  // Excluded from stability enforcement (causes cras
 // Additional function pointers for new hooks
 static ssize_t (*func_read)(int, void *, size_t) = NULL;
 
+static void nex_restore_radio_defaults(void);  // forward declaration
 static void _libmexmon_init() __attribute__((constructor));
+static void _libmexmon_fini() __attribute__((destructor));
+
 static void _libmexmon_init() {
   // Allow interface name override via environment (default: wlan0)
   const char *iface_env = getenv("NEXMON_IFACE");
@@ -293,6 +296,12 @@ static void _libmexmon_init() {
     func_read = (ssize_t (*)(int, void *, size_t))dlsym(REAL_LIBC, "read");
 }
 
+// Destructor: clean up when library is unloaded (e.g., tool exits, nxsp unload)
+// Restores radio to managed-mode defaults so WiFi works normally after
+static void _libmexmon_fini() {
+    nex_restore_radio_defaults();
+}
+
 #ifdef CONFIG_LIBNL
 static int _nl80211_type = 0;
 int nl80211_type() {
@@ -367,6 +376,35 @@ static void nex_enforce_stability(void) {
     // WLC_SET_PROMISC = 1 (Promiscuous Mode)
     val = 1;
     nex_ioctl(nexio, WLC_SET_PROMISC, &val, 4, true);
+}
+
+// Restore radio to normal managed-mode defaults
+// Called when monitor mode is turned off and when the library is unloaded
+// This reverses everything nex_enforce_stability() does, allowing the
+// driver to scan for networks and associate normally again.
+static void nex_restore_radio_defaults(void) {
+    if (!nexio) return;
+    
+    int val;
+    
+    // WLC_SET_SCANSUPPRESS = 0 (Re-enable background scans)
+    // THIS IS THE CRITICAL ONE: without this, "no networks found" after monitor off
+    val = 0;
+    nex_ioctl(nexio, WLC_SET_SCANSUPPRESS, &val, 4, true);
+    
+    // WLC_SET_PROMISC = 0 (Disable promiscuous mode)
+    // Must be off for normal association/scanning to work
+    val = 0;
+    nex_ioctl(nexio, WLC_SET_PROMISC, &val, 4, true);
+    
+    // WLC_SET_PM = 2 (Fast Power Save - Android default)
+    // Restores normal power management so battery isn't drained
+    val = 2;
+    nex_ioctl(nexio, WLC_SET_PM, &val, 4, true);
+    
+    // WLC_SET_WAKE = 0 (Allow sleep - normal behavior)
+    val = 0;
+    nex_ioctl(nexio, WLC_SET_WAKE, &val, 4, true);
 }
 
 int handle_nl_msg(struct nl_msg *msg) {
@@ -623,6 +661,9 @@ int ioctl(int fd, request_t request, ...) {
         }
       } else {
         buf = MONITOR_DISABLED;
+        // Restore radio to normal state so WiFi scanning/association works again
+        // Without this, WLC_SET_SCANSUPPRESS=1 stays active → "no networks found"
+        nex_restore_radio_defaults();
       }
 
       ret = nex_ioctl(nexio, WLC_SET_MONITOR, &buf, 4, true);
@@ -695,6 +736,38 @@ int ioctl(int fd, request_t request, ...) {
 
     // if (ret < 0)
     // fprintf(stderr, "LIBNEXMON: SIOCGIWFREQ not fully implemented\n");
+  } break;
+
+  case SIOCDEVPRIVATE: {
+    // Intercept nexutil commands that go through SIOCDEVPRIVATE
+    // nexutil -m0 uses this path: nex_ioctl → __nex_driver_io → ioctl(SIOCDEVPRIVATE)
+    // We need to detect WLC_SET_MONITOR being set to 0 so we can restore radio defaults
+    struct ifreq *p_ifr = (struct ifreq *)argp;
+    if (p_ifr && p_ifr->ifr_data) {
+      // struct nex_ioctl has .cmd as its first field (unsigned int)
+      unsigned int cmd = *(unsigned int *)p_ifr->ifr_data;
+      if (cmd == WLC_SET_MONITOR) {
+        // Peek at the buffer to check if monitor is being disabled
+        // nex_ioctl struct layout: { cmd, buf_ptr, len, set, ... }
+        // We need to check if set==true and *buf==MONITOR_DISABLED
+        struct {
+          unsigned int cmd;
+          void *buf;
+          unsigned int len;
+          bool set;
+        } *ioc = (void *)p_ifr->ifr_data;
+        
+        if (ioc->set && ioc->buf && ioc->len >= 4) {
+          int monitor_val = *(int *)ioc->buf;
+          if (monitor_val == MONITOR_DISABLED) {
+            // Monitor mode is being turned off (nexutil -m0)
+            // Restore radio to normal state BEFORE the firmware processes it
+            nex_restore_radio_defaults();
+          }
+        }
+      }
+    }
+    // Don't modify ret — it was already set by func_ioctl above
   } break;
   }
   return ret;
