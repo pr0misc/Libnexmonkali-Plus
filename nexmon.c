@@ -84,10 +84,12 @@ typedef uint8_t uint8;
 #define WLC_SET_MONITOR 108
 
 struct nexio {
+  int type;
   struct ifreq *ifr;
   int sock_rx_ioctl;
   int sock_rx_frame;
   int sock_tx;
+  unsigned int securitycookie;
 };
 
 extern int nex_ioctl(struct nexio *nexio, int cmd, void *buf, int len,
@@ -135,7 +137,7 @@ static int (*func_sendmmsg)(int, struct mmsghdr *, unsigned int, int) = NULL;
 static int (*func_ioctl)(int, request_t, void *) = NULL;
 static int (*func_socket)(int, int, int) = NULL;
 static int (*func_bind)(int, const struct sockaddr *, int) = NULL;
-static int (*func_write)(int, const void *, size_t) = NULL;
+static ssize_t (*func_write)(int, const void *, size_t) = NULL;
 #ifdef CONFIG_LIBNL
 static int (*func_nl_send_auto_complete)(struct nl_sock *,
                                          struct nl_msg *) = NULL;
@@ -160,6 +162,10 @@ static void _libmexmon_init() {
   }
 
   nexio = nex_init_ioctl(ifname);
+  if (!nexio || !nexio->ifr) {
+      fprintf(stderr, "LIBNEXMON: FATAL — nex_init_ioctl(\"%s\") failed (out of memory?)\n", ifname);
+      return; // Cannot proceed without nexio
+  }
 
   // Universal Driver Detection
   // Determine injection method based on which driver is loaded
@@ -257,7 +263,7 @@ static void _libmexmon_init() {
         (int (*)(int, const struct sockaddr *, int))dlsym(REAL_LIBC, "bind");
 
   if (!func_write)
-    func_write = (int (*)(int, const void *, size_t))dlsym(REAL_LIBC, "write");
+    func_write = (ssize_t (*)(int, const void *, size_t))dlsym(REAL_LIBC, "write");
 
   if (!func_sendto)
     func_sendto =
@@ -504,7 +510,7 @@ int nl_send_auto_complete(struct nl_sock *sk, struct nl_msg *msg) {
   ret = func_nl_send_auto_complete(sk, msg);
 
   // fprintf(stderr, "\nnl_send_auto_complete()\n");
-  ret = handle_nl_msg(msg);
+  handle_nl_msg(msg);
   return ret;
 }
 #endif // CONFIG_LIBNL
@@ -563,8 +569,8 @@ int ioctl(int fd, request_t request, ...) {
         p_ifr->ifr_hwaddr.sa_family = ARPHRD_IEEE80211;
       else if (buf & MONITOR_RADIOTAP)
         p_ifr->ifr_hwaddr.sa_family = ARPHRD_IEEE80211_RADIOTAP;
-      else if (buf & MONITOR_DISABLED || buf & MONITOR_LOG_ONLY ||
-               buf & MONITOR_DROP_FRM || buf & MONITOR_IPV4_UDP)
+      else if (buf == MONITOR_DISABLED || (buf & MONITOR_LOG_ONLY) ||
+               (buf & MONITOR_DROP_FRM) || (buf & MONITOR_IPV4_UDP))
         p_ifr->ifr_hwaddr.sa_family = ARPHRD_ETHER;
 
       ret = 0;
@@ -752,9 +758,10 @@ static char domain_types[][16] = {
     "AF_PHONET",    "AF_IEEE802154", "AF_CAIF",    "AF_ALG",     "AF_NFC",
     "AF_VSOCK",     "AF_KCM",        "AF_QIPCRTR", "AF_SMC"};
 
-int socket_to_type[65536] = {0};
-char bound_to_correct_if[65536] = {0};
-char socket_is_netlink[65536] = {0};  // Track netlink sockets for read() hook
+#define MAX_TRACKED_FDS 4096
+int socket_to_type[MAX_TRACKED_FDS] = {0};
+char bound_to_correct_if[MAX_TRACKED_FDS] = {0};
+char socket_is_netlink[MAX_TRACKED_FDS] = {0};  // Track netlink sockets for read() hook
 
 int socket(int domain, int type, int protocol) {
   int ret;
@@ -762,7 +769,7 @@ int socket(int domain, int type, int protocol) {
   ret = func_socket(domain, type, protocol);
 
   // save the socket type
-  if (ret > 0 && ret < sizeof(socket_to_type) / sizeof(socket_to_type[0])) {
+  if (ret > 0 && ret < (int)(sizeof(socket_to_type) / sizeof(socket_to_type[0]))) {
     socket_to_type[ret] = type;
     // Track netlink sockets for the read() error suppression hook
     socket_is_netlink[ret] = (domain == AF_NETLINK) ? 1 : 0;
@@ -785,8 +792,9 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   char sll_ifname[IF_NAMESIZE] = {0};
   if_indextoname(sll->sll_ifindex, sll_ifname);
 
-  if ((sockfd < sizeof(bound_to_correct_if) / sizeof(bound_to_correct_if[0])) &&
-      !strncmp(ifname, sll_ifname, sizeof(ifname)))
+  if ((sockfd > 0) &&
+      (sockfd < (int)(sizeof(bound_to_correct_if) / sizeof(bound_to_correct_if[0]))) &&
+      strcmp(ifname, sll_ifname) == 0)
     bound_to_correct_if[sockfd] = 1;
 
   // printf("LIBNEXMON: %d = %s(%d, 0x%p, %d) sll_ifindex=%d ifname=%s\n", ret,
@@ -869,8 +877,6 @@ ssize_t write(int fd, const void *buf, size_t count) {
         ts.tv_nsec = inject_delay_ns;
         nanosleep(&ts, NULL);
     }
-
-    if (current_inject_method != INJECT_RAW_SOCKET) ret = count;
   } else {
     // otherwise write the regular frame to the socket
     ret = func_write(fd, buf, count);
@@ -941,13 +947,11 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
     // Periodic stability enforcement during injection
     // Prevents radio from going to sleep during long capture sessions
     // Every 50 frames, re-enforce wake state (not for aireplay - it's too fast)
-    static int inject_counter = 0;
-    if (!is_aireplay && ++inject_counter >= 50) {
-        inject_counter = 0;
+    static int inject_counter_sendto = 0;
+    if (!is_aireplay && ++inject_counter_sendto >= 50) {
+        inject_counter_sendto = 0;
         nex_enforce_stability();
     }
-
-    if (current_inject_method != INJECT_RAW_SOCKET) ret = len;
   } else {
     // otherwise write the regular frame to the socket
     ret = func_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
@@ -1030,8 +1034,12 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
         nanosleep(&ts, NULL);
     }
 
-    // ret is already set: func_sendmsg return value for BCM43436b0,
-    // or total_len for BCM4375b1 (set inside the else block above)
+    // Periodic stability enforcement (same as sendto)
+    static int inject_counter_sendmsg = 0;
+    if (!is_aireplay && ++inject_counter_sendmsg >= 50) {
+        inject_counter_sendmsg = 0;
+        nex_enforce_stability();
+    }
   } else {
     ret = func_sendmsg(sockfd, msg, flags);
   }
@@ -1085,7 +1093,12 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
         nanosleep(&ts, NULL);
     }
 
-    if (current_inject_method != INJECT_RAW_SOCKET) ret = len;
+    // Periodic stability enforcement (same as sendto)
+    static int inject_counter_send = 0;
+    if (!is_aireplay && ++inject_counter_send >= 50) {
+        inject_counter_send = 0;
+        nex_enforce_stability();
+    }
   } else {
     ret = func_send(sockfd, buf, len, flags);
   }
@@ -1162,7 +1175,12 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
         nanosleep(&ts, NULL);
     }
 
-    if (current_inject_method != INJECT_RAW_SOCKET) ret = vlen;
+    // Periodic stability enforcement (same as sendto)
+    static int inject_counter_sendmmsg = 0;
+    if (!is_aireplay && ++inject_counter_sendmmsg >= 50) {
+        inject_counter_sendmmsg = 0;
+        nex_enforce_stability();
+    }
   } else {
     ret = func_sendmmsg(sockfd, msgvec, vlen, flags);
   }

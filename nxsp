@@ -24,11 +24,12 @@ MODE="$1"
 
 if [ "$MODE" == "load" ]; then
     echo "[*] nxsp: Spawning new shell with Libnexmonkali loaded..."
-    echo "[*] Default Delay: 70ms (Safe Mode). Use 'export NEXMON_DELAY=0' to override."
+    echo "[*] Delay: Smart Auto-Detect (per-tool). Use 'export NEXMON_DELAY=<ns>' to override."
     echo "[*] Type 'exit' or use 'nxsp unload' to leave this mode."
     export LD_PRELOAD=$LIBPATH
-    # Default to safe mode if not set
-    if [ -z "$NEXMON_DELAY" ]; then export NEXMON_DELAY=70000000; fi
+    # Do NOT set NEXMON_DELAY here — let the library's smart auto-detect
+    # choose the optimal delay per tool (5ms reaver, 15ms aireplay, etc.)
+    # User can still override: export NEXMON_DELAY=0
     exec $SHELL
 
 elif [ "$MODE" == "unload" ]; then
